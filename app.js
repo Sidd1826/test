@@ -1,38 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { Download, FileSpreadsheet, RefreshCw, Calendar, Database, AlertCircle, CheckCircle, Loader2, X, LogOut, User } from 'lucide-react';
-import { PublicClientApplication } from '@azure/msal-browser';
-import { MsalProvider, useMsal, useIsAuthenticated } from '@azure/msal-react';
-
-// MSAL Configuration
-const msalConfig = {
-  auth: {
-    clientId: 'YOUR_CLIENT_ID', // Replace with your Azure AD App Client ID
-    authority: 'https://login.microsoftonline.com/YOUR_TENANT_ID', // Replace with your Tenant ID
-    redirectUri: window.location.origin,
-  },
-  cache: {
-    cacheLocation: 'localStorage',
-    storeAuthStateInCookie: false,
-  },
-};
-
-const loginRequest = {
-  scopes: ['User.Read'],
-};
-
-const msalInstance = new PublicClientApplication(msalConfig);
+import { Download, FileSpreadsheet, RefreshCw, Calendar, Database, AlertCircle, CheckCircle, Loader2, X } from 'lucide-react';
 
 // API Service
 const apiService = {
   baseUrl: 'http://localhost:5000',
   
-  async fetchFRICount(date, token) {
+  // FRI APIs
+  async fetchFRICount(date) {
     const response = await fetch(`${this.baseUrl}/fri/count`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ date })
     });
     
@@ -45,13 +22,10 @@ const apiService = {
     return data.count || data.total_count || 0;
   },
   
-  async generateFRIExcel(date, token) {
+  async generateFRIExcel(date) {
     const response = await fetch(`${this.baseUrl}/fri/data/excel`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ date })
     });
     
@@ -65,13 +39,11 @@ const apiService = {
     return { blob, fileName };
   },
   
-  async fetchMNRLCount(date, type, token) {
+  // MNRL APIs
+  async fetchMNRLCount(date, type) {
     const response = await fetch(`${this.baseUrl}/mnrl/count`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ date, type })
     });
     
@@ -84,13 +56,10 @@ const apiService = {
     return data.count || data.total_count || 0;
   },
   
-  async generateMNRLExcel(date, type, token) {
+  async generateMNRLExcel(date, type) {
     const response = await fetch(`${this.baseUrl}/mnrl/data/excel`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ date, type })
     });
     
@@ -104,7 +73,8 @@ const apiService = {
     return { blob, fileName };
   },
   
-  async saveToDataverse(fileName, fileBlob, recordCount, date, module, token, dataType = null) {
+  // Dataverse APIs
+  async saveToDataverse(fileName, fileBlob, recordCount, date, module, dataType = null) {
     const formData = new FormData();
     formData.append('file', fileBlob, fileName);
     formData.append('record_count', recordCount);
@@ -114,9 +84,6 @@ const apiService = {
     
     const response = await fetch(`${this.baseUrl}/dataverse/save`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`
-      },
       body: formData
     });
     
@@ -128,23 +95,15 @@ const apiService = {
     return await response.json();
   },
   
-  async listFiles(module, token) {
-    const response = await fetch(`${this.baseUrl}/dataverse/list?module=${module}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    });
+  async listFiles(module) {
+    const response = await fetch(`${this.baseUrl}/dataverse/list?module=${module}`);
     if (!response.ok) throw new Error('Failed to load files');
     const data = await response.json();
     return data.data || data || [];
   },
   
-  async downloadFile(fileId, token) {
-    const response = await fetch(`${this.baseUrl}/dataverse/download/${fileId}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    });
+  async downloadFile(fileId) {
+    const response = await fetch(`${this.baseUrl}/dataverse/download/${fileId}`);
     if (!response.ok) throw new Error('Failed to download file');
     return await response.blob();
   }
@@ -364,8 +323,8 @@ const FilesTable = ({ files, loading, onDownload, showDataType = false }) => {
   );
 };
 
-// FRI Page Component
-const FRIPage = ({ token }) => {
+// FRI Module Component
+const FRIModule = () => {
   const [savedFiles, setSavedFiles] = useState([]);
   const [recordCount, setRecordCount] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -377,7 +336,7 @@ const FRIPage = ({ token }) => {
   const loadSavedFiles = async () => {
     setLoadingFiles(true);
     try {
-      const files = await apiService.listFiles('FRI', token);
+      const files = await apiService.listFiles('FRI');
       setSavedFiles(files);
     } catch (err) {
       setError('Failed to load saved files');
@@ -392,7 +351,7 @@ const FRIPage = ({ token }) => {
     setSuccess('');
     
     try {
-      const count = await apiService.fetchFRICount(selectedDate, token);
+      const count = await apiService.fetchFRICount(selectedDate);
       setRecordCount(count);
       
       if (count === 0) {
@@ -400,7 +359,7 @@ const FRIPage = ({ token }) => {
         return;
       }
       
-      const { blob, fileName } = await apiService.generateFRIExcel(selectedDate, token);
+      const { blob, fileName } = await apiService.generateFRIExcel(selectedDate);
       
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -409,7 +368,7 @@ const FRIPage = ({ token }) => {
       link.click();
       window.URL.revokeObjectURL(url);
       
-      const savedFile = await apiService.saveToDataverse(fileName, blob, count, selectedDate, 'FRI', token);
+      const savedFile = await apiService.saveToDataverse(fileName, blob, count, selectedDate, 'FRI');
       
       setSavedFiles(prev => [savedFile, ...prev]);
       setSuccess(`Successfully exported ${count.toLocaleString()} records for ${selectedDate}`);
@@ -427,7 +386,7 @@ const FRIPage = ({ token }) => {
     setRecordCount(null);
     
     try {
-      const count = await apiService.fetchFRICount(date, token);
+      const count = await apiService.fetchFRICount(date);
       setRecordCount(count);
     } catch (err) {
       console.error('Failed to fetch count:', err);
@@ -436,7 +395,7 @@ const FRIPage = ({ token }) => {
 
   const handleDownloadSaved = async (file) => {
     try {
-      const blob = await apiService.downloadFile(file.id, token);
+      const blob = await apiService.downloadFile(file.id);
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -449,10 +408,8 @@ const FRIPage = ({ token }) => {
   };
 
   useEffect(() => {
-    if (token) {
-      loadSavedFiles();
-    }
-  }, [token]);
+    loadSavedFiles();
+  }, []);
 
   useEffect(() => {
     if (success) {
@@ -531,8 +488,8 @@ const FRIPage = ({ token }) => {
   );
 };
 
-// MNRL Page Component
-const MNRLPage = ({ token }) => {
+// MNRL Module Component
+const MNRLModule = () => {
   const [savedFiles, setSavedFiles] = useState([]);
   const [normalCount, setNormalCount] = useState(null);
   const [reactivatedCount, setReactivatedCount] = useState(null);
@@ -545,7 +502,7 @@ const MNRLPage = ({ token }) => {
   const loadSavedFiles = async () => {
     setLoadingFiles(true);
     try {
-      const files = await apiService.listFiles('MNRL', token);
+      const files = await apiService.listFiles('MNRL');
       setSavedFiles(files);
     } catch (err) {
       setError('Failed to load saved files');
@@ -560,14 +517,14 @@ const MNRLPage = ({ token }) => {
     setSuccess('');
     
     try {
-      const count = await apiService.fetchMNRLCount(selectedDate, type, token);
+      const count = await apiService.fetchMNRLCount(selectedDate, type);
       
       if (count === 0) {
         setError(`No ${type} records found for the selected date`);
         return;
       }
       
-      const { blob, fileName } = await apiService.generateMNRLExcel(selectedDate, type, token);
+      const { blob, fileName } = await apiService.generateMNRLExcel(selectedDate, type);
       
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -576,7 +533,7 @@ const MNRLPage = ({ token }) => {
       link.click();
       window.URL.revokeObjectURL(url);
       
-      const savedFile = await apiService.saveToDataverse(fileName, blob, count, selectedDate, 'MNRL', token, type);
+      const savedFile = await apiService.saveToDataverse(fileName, blob, count, selectedDate, 'MNRL', type);
       
       setSavedFiles(prev => [savedFile, ...prev]);
       setSuccess(`Successfully exported ${count.toLocaleString()} ${type} records for ${selectedDate}`);
@@ -596,8 +553,8 @@ const MNRLPage = ({ token }) => {
     
     try {
       const [normal, reactivated] = await Promise.all([
-        apiService.fetchMNRLCount(date, 'normal', token),
-        apiService.fetchMNRLCount(date, 'reactivated', token)
+        apiService.fetchMNRLCount(date, 'normal'),
+        apiService.fetchMNRLCount(date, 'reactivated')
       ]);
       setNormalCount(normal);
       setReactivatedCount(reactivated);
@@ -608,7 +565,7 @@ const MNRLPage = ({ token }) => {
 
   const handleDownloadSaved = async (file) => {
     try {
-      const blob = await apiService.downloadFile(file.id, token);
+      const blob = await apiService.downloadFile(file.id);
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -621,10 +578,8 @@ const MNRLPage = ({ token }) => {
   };
 
   useEffect(() => {
-    if (token) {
-      loadSavedFiles();
-    }
-  }, [token]);
+    loadSavedFiles();
+  }, []);
 
   useEffect(() => {
     if (success) {
@@ -637,8 +592,8 @@ const MNRLPage = ({ token }) => {
     <div>
       <div className="bg-white rounded-xl shadow-lg p-8 mb-6">
         <div className="flex items-center gap-3 mb-6">
-          <div className="p-3 bg-purple-100 rounded-lg">
-            <Database className="w-6 h-6 text-purple-600" />
+          <div className="p-3 bg-blue-100 rounded-lg">
+            <Database className="w-6 h-6 text-blue-600" />
           </div>
           <div>
             <h1 className="text-3xl font-bold text-gray-800">MNRL Data Export</h1>
@@ -654,22 +609,22 @@ const MNRLPage = ({ token }) => {
             onChange={handleDateChange}
             label="Select Export Date"
           />
-          <StatsCard title="Normal Data Records" count={normalCount} date={selectedDate} color="green" />
-          <StatsCard title="Reactivated Records" count={reactivatedCount} date={selectedDate} color="purple" />
+          <StatsCard title="Normal Data Records" count={normalCount} date={selectedDate} color="blue" />
+          <StatsCard title="Reactivated Records" count={reactivatedCount} date={selectedDate} color="blue" />
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
           <ExportButton 
             onClick={() => handleExportData('normal')}
             loading={loading}
             disabled={normalCount === 0}
-            label="Export Normal Data"
+            label="Export Normal Data to Excel & Save"
           />
           <ExportButton 
             onClick={() => handleExportData('reactivated')}
             loading={loading}
             disabled={reactivatedCount === 0}
-            label="Export Reactivated Data"
+            label="Export Reactivated Data to Excel & Save"
           />
         </div>
 
@@ -684,19 +639,19 @@ const MNRLPage = ({ token }) => {
       <div className="bg-white rounded-xl shadow-lg p-6">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
-            <FileSpreadsheet className="w-6 h-6 text-purple-600" />
+            <FileSpreadsheet className="w-6 h-6 text-blue-600" />
             <h2 className="text-xl font-bold text-gray-800">MNRL Exported Files</h2>
           </div>
           <div className="flex items-center gap-3">
             <button
               onClick={loadSavedFiles}
               disabled={loadingFiles}
-              className="flex items-center gap-2 px-4 py-2 text-sm text-purple-600 hover:bg-purple-50 rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 text-sm text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
             >
               <RefreshCw className={`w-4 h-4 ${loadingFiles ? 'animate-spin' : ''}`} />
               Refresh
             </button>
-            <span className="px-3 py-1 bg-purple-100 text-purple-700 rounded-full text-sm font-medium">
+            <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm font-medium">
               {savedFiles.length} files
             </span>
           </div>
@@ -713,19 +668,22 @@ const MNRLPage = ({ token }) => {
   );
 };
 
-// Navigation Component
-const Navigation = ({ currentRoute, onNavigate, userName, onLogout }) => {
+// Main App Component with Navigation
+const App = () => {
+  const [activeModule, setActiveModule] = useState('FRI');
+
   return (
-    <nav className="bg-white shadow-md sticky top-0 z-10">
-      <div className="max-w-6xl mx-auto px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      {/* Navigation */}
+      <nav className="bg-white shadow-md sticky top-0 z-10">
+        <div className="max-w-6xl mx-auto px-6 py-4">
+          <div className="flex items-center justify-between">
             <h1 className="text-2xl font-bold text-gray-800">Data Export Manager</h1>
             <div className="flex gap-2">
               <button
-                onClick={() => onNavigate('/fri')}
+                onClick={() => setActiveModule('FRI')}
                 className={`px-6 py-2 rounded-lg font-medium transition-all ${
-                  currentRoute === '/fri'
+                  activeModule === 'FRI'
                     ? 'bg-blue-600 text-white shadow-md'
                     : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                 }`}
@@ -733,9 +691,9 @@ const Navigation = ({ currentRoute, onNavigate, userName, onLogout }) => {
                 FRI
               </button>
               <button
-                onClick={() => onNavigate('/mnrl')}
+                onClick={() => setActiveModule('MNRL')}
                 className={`px-6 py-2 rounded-lg font-medium transition-all ${
-                  currentRoute === '/mnrl'
+                  activeModule === 'MNRL'
                     ? 'bg-purple-600 text-white shadow-md'
                     : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                 }`}
@@ -744,122 +702,15 @@ const Navigation = ({ currentRoute, onNavigate, userName, onLogout }) => {
               </button>
             </div>
           </div>
-          
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 px-4 py-2 bg-gray-100 rounded-lg">
-              <User className="w-5 h-5 text-gray-600" />
-              <span className="font-medium text-gray-800">{userName}</span>
-            </div>
-            <button
-              onClick={onLogout}
-              className="flex items-center gap-2 px-4 py-2 bg-red-100 text-red-700 rounded-lg hover:bg-red-200 transition-colors"
-            >
-              <LogOut className="w-4 h-4" />
-              Logout
-            </button>
-          </div>
         </div>
-      </div>
-    </nav>
-  );
-};
+      </nav>
 
-// ...existing code...
-
-// Login Page Component
-const LoginPage = ({ onLogin }) => {
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-6">
-      <div className="bg-white rounded-2xl shadow-2xl p-12 max-w-md w-full">
-        <div className="text-center mb-8">
-          <div className="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Database className="w-10 h-10 text-blue-600" />
-          </div>
-          <h1 className="text-3xl font-bold text-gray-800 mb-2">
-            Data Export Manager
-          </h1>
-          <p className="text-gray-600">
-            Sign in with your Microsoft account
-          </p>
-        </div>
-        
-        <button
-          onClick={onLogin}
-          className="w-full px-6 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-lg hover:from-blue-700 hover:to-indigo-700 transition-all shadow-lg hover:shadow-xl font-semibold text-lg"
-        >
-          Sign in with Microsoft
-        </button>
+      {/* Main Content */}
+      <div className="max-w-6xl mx-auto p-6">
+        {activeModule === 'FRI' ? <FRIModule /> : <MNRLModule />}
       </div>
     </div>
   );
 };
 
-// Main App Component
-const AppContent = () => {
-  const { accounts } = useMsal();
-  const isAuthenticated = useIsAuthenticated();
-  const [currentRoute, setCurrentRoute] = useState('/fri');
-  const [token, setToken] = useState(null);
-
-  const handleLogin = async () => {
-    try {
-      const response = await msalInstance.loginPopup(loginRequest);
-      setToken(response.accessToken);
-    } catch (error) {
-      console.error('Login failed:', error);
-    }
-  };
-
-  const handleLogout = () => {
-    msalInstance.logout();
-    setToken(null);
-    setCurrentRoute('/fri');
-  };
-
-  const acquireToken = async () => {
-    try {
-      const response = await msalInstance.acquireTokenSilent({
-        scopes: loginRequest.scopes,
-        account: accounts[0]
-      });
-      setToken(response.accessToken);
-    } catch (error) {
-      console.error('Token acquisition failed:', error);
-    }
-  };
-
-  useEffect(() => {
-    if (isAuthenticated && accounts.length > 0) {
-      acquireToken();
-    }
-  }, [isAuthenticated, accounts]);
-
-  if (!isAuthenticated) {
-    return <LoginPage onLogin={handleLogin} />;
-  }
-
-  return (
-    <div className="min-h-screen bg-gray-50">
-      <Navigation 
-        currentRoute={currentRoute} 
-        onNavigate={setCurrentRoute}
-        userName={accounts[0]?.name || 'User'}
-        onLogout={handleLogout}
-      />
-      
-      <main className="max-w-6xl mx-auto px-6 py-8">
-        {currentRoute === '/fri' && <FRIPage token={token} />}
-        {currentRoute === '/mnrl' && <MNRLPage token={token} />}
-      </main>
-    </div>
-  );
-};
-
-// Root App Component
-export default function App() {
-  return (
-    <MsalProvider instance={msalInstance}>
-      <AppContent />
-    </MsalProvider>
-  );
-}
+export default App;
