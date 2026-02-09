@@ -15,6 +15,9 @@ from threading import Lock
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Environment variables
+BankId = os.getenv("BankId")
+
 # Token cache
 _token_cache = {
     'token': None,
@@ -25,6 +28,7 @@ _token_lock = Lock()
 # Session
 _session = None
 _session_lock = Lock()
+
 
 def get_session_with_retries():
     """Create a requests session with retry logic and connection pooling"""
@@ -48,7 +52,7 @@ def get_session_with_retries():
         
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
-            pool_connections=20,  # Increased for parallel
+            pool_connections=20,
             pool_maxsize=20,
             pool_block=False
         )
@@ -60,8 +64,17 @@ def get_session_with_retries():
         return session
 
 
-def fri_auth(key_id: str, force_refresh=False) -> str:
-    """Authenticate with FRI API and cache the token (thread-safe)"""
+def mnrl_auth(key_id: str, force_refresh=False) -> str:
+    """
+    Authenticate with MNRL API and cache the token (thread-safe)
+    
+    Args:
+        key_id: The encryption key ID
+        force_refresh: Force a new token even if cached one is valid
+        
+    Returns:
+        Authentication token string
+    """
     global _token_cache
     
     with _token_lock:
@@ -70,15 +83,15 @@ def fri_auth(key_id: str, force_refresh=False) -> str:
             if datetime.now() < _token_cache['expires_at']:
                 return _token_cache['token']
         
-        print("Fetching new authentication token...")
+        print("Fetching new MNRL authentication token...")
         
         payload = {
-            "email": os.getenv("FRI_EMAIL"),
-            "password": os.getenv("FRI_PASSWORD")
+            "email": os.getenv("MNRL_EMAIL"),
+            "password": os.getenv("MNRL_PASSWORD")
         }
         
         if not payload["email"] or not payload["password"]:
-            raise ValueError("FRI_EMAIL and FRI_PASSWORD environment variables must be set")
+            raise ValueError("MNRL_EMAIL and MNRL_PASSWORD environment variables must be set")
         
         encrypted_payload = encrypt_data(payload, key_id)
         
@@ -86,7 +99,7 @@ def fri_auth(key_id: str, force_refresh=False) -> str:
             "Content-Type": "application/json"
         }
         
-        AUTH_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/auth"
+        AUTH_URL = "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankapi/v2/auth"
         
         session = get_session_with_retries()
         
@@ -102,7 +115,7 @@ def fri_auth(key_id: str, force_refresh=False) -> str:
             response.raise_for_status()
             
             if not response.text:
-                raise ValueError("Empty response from auth API")
+                raise ValueError("Empty response from MNRL auth API")
             
             res = response.json()
             token = res.get('token')
@@ -114,21 +127,37 @@ def fri_auth(key_id: str, force_refresh=False) -> str:
             _token_cache['token'] = token
             _token_cache['expires_at'] = datetime.now() + timedelta(minutes=120)
             
-            print("✓ Authentication successful")
+            print("✓ MNRL Authentication successful")
             return token
             
         except Exception as e:
-            print(f"✗ Auth API Error: {e}")
+            print(f"✗ MNRL Auth API Error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response status: {e.response.status_code}")
+                print(f"Response body: {e.response.text}")
             raise
 
 
-def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
-    """Get count of records for a specific date"""
+def mnrl_count(key_id: str, count_date: str, max_retries=3) -> dict:
+    """
+    Get count of MNRL records for a specific date
+    
+    Args:
+        key_id: The encryption key ID
+        count_date: Date in YYYY-MM-DD format
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Dictionary with count and date
+    """
     session = get_session_with_retries()
     
     for attempt in range(max_retries):
         try:
-            token = fri_auth(key_id, force_refresh=(attempt > 0))
+            token = mnrl_auth(key_id, force_refresh=(attempt > 0))
+            
+            if not token:
+                raise ValueError("Failed to retrieve MNRL auth token")
             
             headers = {
                 "Content-Type": "application/json",
@@ -136,16 +165,286 @@ def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
             }
             
             body = {"date": count_date}
-            FRI_COUNT_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/count"
+            MNRL_COUNT_URL = "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankapi/v2/count"
+            
+            print(f"Fetching MNRL count for date: {count_date} (attempt {attempt + 1}/{max_retries})")
             
             response = session.post(
-                FRI_COUNT_URL,
+                MNRL_COUNT_URL,
                 json=body,
                 headers=headers,
                 timeout=30,
                 verify=False
             )
             
+            # Handle 401 Unauthorized
+            if response.status_code == 401 and attempt < max_retries - 1:
+                print("Token expired, refreshing...")
+                with _token_lock:
+                    _token_cache['token'] = None
+                    _token_cache['expires_at'] = None
+                time.sleep(1)
+                continue
+            
+            # Handle 429 Rate Limit
+            if response.status_code == 429 and attempt < max_retries - 1:
+                retry_after = int(response.headers.get('Retry-After', 10))
+                print(f"Rate limited. Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
+            
+            response.raise_for_status()
+            
+            if not response.text:
+                raise ValueError(f"Empty response from MNRL count API")
+            
+            result = response.json()
+            print(f"✓ MNRL Count retrieved: {result.get('count', 0)} records")
+            return result
+        
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt)
+                print(f"Connection error, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+        except Exception as e:
+            print(f"✗ MNRL Count API Error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response status: {e.response.status_code}")
+                print(f"Response body: {e.response.text}")
+            raise
+    
+    raise ValueError(f"Failed to get MNRL count after {max_retries} attempts")
+
+
+def mnrl_data_baseline(key_id: str, count: int, offset: int, date: str, Bank_Id: str = None, max_retries=3) -> dict:
+    """
+    Fetch MNRL baseline data with pagination (optimized for parallel calls)
+    
+    Args:
+        key_id: The encryption key ID
+        count: Number of records to fetch
+        offset: Starting offset
+        date: Date in YYYY-MM-DD format
+        Bank_Id: Bank identifier
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Encrypted payload dictionary
+    """
+    if Bank_Id is None:
+        Bank_Id = BankId
+    
+    session = get_session_with_retries()
+    
+    for attempt in range(max_retries):
+        try:
+            token = mnrl_auth(key_id)
+            
+            if not token:
+                raise ValueError("Failed to retrieve MNRL auth token")
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": token
+            }
+            
+            body = {
+                "date": date,
+                "BankId": Bank_Id,
+                "offset": offset,
+                "count": count
+            }
+            
+            MNRL_DATA_URL = "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankapi/v2/mnrldata"
+            
+            response = session.post(
+                MNRL_DATA_URL,
+                json=body,
+                headers=headers,
+                timeout=45,
+                verify=False
+            )
+            
+            # Handle 401 Unauthorized
+            if response.status_code == 401 and attempt < max_retries - 1:
+                with _token_lock:
+                    _token_cache['token'] = None
+                    _token_cache['expires_at'] = None
+                time.sleep(1)
+                continue
+            
+            # Handle 429 Rate Limit
+            if response.status_code == 429 and attempt < max_retries - 1:
+                retry_after = int(response.headers.get('Retry-After', 10))
+                time.sleep(retry_after)
+                continue
+            
+            response.raise_for_status()
+            
+            if not response.text:
+                raise ValueError("Empty response from MNRL data API")
+            
+            return response.json()
+        
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 4)
+                time.sleep(wait_time)
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                raise
+    
+    raise ValueError(f"Failed to fetch MNRL data after {max_retries} attempts")
+
+
+def mnrl_data(key_id: str, total_count: int, date: str, BATCH_SIZE: int = 2000, Bank_Id: str = None, max_workers: int = 5) -> list:
+    """
+    Fetch and decrypt all MNRL data in PARALLEL batches
+    
+    Args:
+        key_id: The encryption key ID
+        total_count: Total number of records to fetch
+        date: Date in YYYY-MM-DD format
+        BATCH_SIZE: Number of records per batch (default: 2000)
+        Bank_Id: Bank identifier
+        max_workers: Number of parallel threads (default: 5)
+        
+    Returns:
+        List of all decrypted records
+    """
+    if Bank_Id is None:
+        Bank_Id = BankId
+    
+    all_data = []
+    num_batches = math.ceil(total_count / BATCH_SIZE)
+    failed_batches = []
+    data_lock = Lock()
+    
+    print(f"\n{'='*70}")
+    print(f"Starting PARALLEL MNRL batch fetch")
+    print(f"Total records: {total_count}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Number of batches: {num_batches}")
+    print(f"Parallel workers: {max_workers}")
+    print(f"{'='*70}\n")
+    
+    def fetch_single_batch(batch_num):
+        """Fetch and decrypt a single batch"""
+        offset = batch_num * BATCH_SIZE
+        current_batch_size = min(BATCH_SIZE, total_count - offset)
+        
+        try:
+            # Fetch encrypted payload
+            encrypted_payload = mnrl_data_baseline(key_id, current_batch_size, offset, date, Bank_Id)
+            
+            # Decrypt
+            decrypted_batch = decrypt_data(encrypted_payload)
+            
+            # Parse
+            records = []
+            if isinstance(decrypted_batch, str):
+                try:
+                    decrypted_json = json.loads(decrypted_batch)
+                    if isinstance(decrypted_json, dict) and "data" in decrypted_json:
+                        records = decrypted_json["data"]
+                    elif isinstance(decrypted_json, list):
+                        records = decrypted_json
+                except json.JSONDecodeError as e:
+                    print(f"[Batch-{batch_num+1}] JSON parse error: {e}")
+                    return None
+            elif isinstance(decrypted_batch, list):
+                records = decrypted_batch
+            
+            return records if records else None
+        
+        except Exception as e:
+            print(f"[Batch-{batch_num+1}] ✗ Error: {e}")
+            return None
+    
+    # Parallel execution
+    start_time = time.time()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {executor.submit(fetch_single_batch, i): i for i in range(num_batches)}
+        
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_batch):
+            batch_num = future_to_batch[future]
+            completed += 1
+            
+            try:
+                records = future.result()
+                if records:
+                    with data_lock:
+                        all_data.extend(records)
+                    print(f"✓ Progress: {completed}/{num_batches} ({len(all_data)}/{total_count} records)")
+                else:
+                    failed_batches.append(batch_num)
+                    print(f"⚠ Batch {batch_num+1} failed")
+                    
+            except Exception as e:
+                failed_batches.append(batch_num)
+                print(f"✗ Batch {batch_num+1} exception: {e}")
+    
+    elapsed_time = time.time() - start_time
+    
+    print(f"\n{'='*70}")
+    print(f"✓ Complete in {elapsed_time:.1f}s (avg {elapsed_time/num_batches:.1f}s/batch)")
+    print(f"Records: {len(all_data)}/{total_count} ({len(all_data)/total_count*100:.1f}%)")
+    if failed_batches:
+        print(f"⚠ Failed: {failed_batches}")
+    print(f"{'='*70}\n")
+    
+    return all_data
+
+
+def mnrl_count_reactivated(key_id: str, count_date: str, max_retries=3) -> dict:
+    """
+    Get count of MNRL reactivated records for a specific date
+    
+    Args:
+        key_id: The encryption key ID
+        count_date: Date in YYYY-MM-DD format
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Dictionary with count and date
+    """
+    session = get_session_with_retries()
+    
+    for attempt in range(max_retries):
+        try:
+            token = mnrl_auth(key_id, force_refresh=(attempt > 0))
+            
+            if not token:
+                raise ValueError("Failed to retrieve MNRL auth token")
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": token
+            }
+            
+            body = {"date": count_date}
+            MNRL_COUNT_URL = "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankreactivatedapi/v2/count"
+            
+            print(f"Fetching MNRL reactivated count for date: {count_date} (attempt {attempt + 1}/{max_retries})")
+            
+            response = session.post(
+                MNRL_COUNT_URL,
+                json=body,
+                headers=headers,
+                timeout=30,
+                verify=False
+            )
+            
+            # Handle 401 Unauthorized
             if response.status_code == 401 and attempt < max_retries - 1:
                 print("Token expired, refreshing...")
                 with _token_lock:
@@ -157,10 +456,10 @@ def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
             response.raise_for_status()
             
             if not response.text:
-                raise ValueError(f"Empty response from count API")
+                raise ValueError(f"Empty response from MNRL reactivated count API")
             
             result = response.json()
-            print(f"✓ Count retrieved: {result.get('count', 0)} records")
+            print(f"✓ MNRL Reactivated Count: {result.get('count', 0)} records")
             return result
         
         except requests.exceptions.ConnectionError as e:
@@ -171,19 +470,38 @@ def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
             else:
                 raise
         except Exception as e:
-            print(f"✗ Count API Error: {e}")
+            print(f"✗ MNRL Reactivated Count API Error: {e}")
             raise
     
-    raise ValueError(f"Failed to get count after {max_retries} attempts")
+    raise ValueError(f"Failed to get MNRL reactivated count after {max_retries} attempts")
 
 
-def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, max_retries=3) -> dict:
-    """Fetch FRI data with pagination (optimized for parallel calls)"""
+def mnrl_data_reactivated(key_id: str, count: int, offset: int, date: str, Bank_Id: str = None, max_retries=3) -> dict:
+    """
+    Fetch MNRL reactivated data with pagination (optimized for parallel calls)
+    
+    Args:
+        key_id: The encryption key ID
+        count: Number of records to fetch
+        offset: Starting offset
+        date: Date in YYYY-MM-DD format
+        Bank_Id: Bank identifier
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Encrypted payload dictionary
+    """
+    if Bank_Id is None:
+        Bank_Id = BankId
+    
     session = get_session_with_retries()
     
     for attempt in range(max_retries):
         try:
-            token = fri_auth(key_id)
+            token = mnrl_auth(key_id)
+            
+            if not token:
+                raise ValueError("Failed to retrieve MNRL auth token")
             
             headers = {
                 "Content-Type": "application/json",
@@ -192,21 +510,22 @@ def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, ma
             
             body = {
                 "date": date,
-                "client_id": client_id,
+                "BankId": Bank_Id,
                 "offset": offset,
                 "count": count
             }
             
-            FRI_DATA_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/data"
+            MNRL_DATA_URL = "https://mnrlbankapitestgateway.sancharsaathi.gov.in/mnrlbankreactivatedapi/v2/reactivated"
             
             response = session.post(
-                FRI_DATA_URL,
+                MNRL_DATA_URL,
                 json=body,
                 headers=headers,
-                timeout=45,  # Reduced timeout
+                timeout=45,
                 verify=False
             )
             
+            # Handle 401 Unauthorized
             if response.status_code == 401 and attempt < max_retries - 1:
                 with _token_lock:
                     _token_cache['token'] = None
@@ -217,13 +536,13 @@ def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, ma
             response.raise_for_status()
             
             if not response.text:
-                raise ValueError("Empty response from data API")
+                raise ValueError("Empty response from MNRL reactivated data API")
             
             return response.json()
         
         except requests.exceptions.ConnectionError as e:
             if attempt < max_retries - 1:
-                wait_time = min(2 ** attempt, 4)  # Cap at 4 seconds
+                wait_time = min(2 ** attempt, 4)
                 time.sleep(wait_time)
             else:
                 raise
@@ -233,29 +552,38 @@ def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, ma
             else:
                 raise
     
-    raise ValueError(f"Failed to fetch data after {max_retries} attempts")
+    raise ValueError(f"Failed to fetch MNRL reactivated data after {max_retries} attempts")
 
 
-def fetch_and_decrypt_all(key_id: str, total_count: int, date: str, client_id: str, BATCH_SIZE: int = 2000, max_workers: int = 5) -> list:
+def mnrl_data_reactivated_excel(key_id: str, total_count: int, date: str, BATCH_SIZE: int = 2000, Bank_Id: str = None, max_workers: int = 5) -> list:
     """
-    Fetch and decrypt all data in PARALLEL batches
+    Fetch and decrypt all MNRL reactivated data in PARALLEL batches
     
     Args:
-        BATCH_SIZE: Increased default to 2000
+        key_id: The encryption key ID
+        total_count: Total number of records to fetch
+        date: Date in YYYY-MM-DD format
+        BATCH_SIZE: Number of records per batch (default: 2000)
+        Bank_Id: Bank identifier
         max_workers: Number of parallel threads (default: 5)
+        
+    Returns:
+        List of all decrypted records
     """
+    if Bank_Id is None:
+        Bank_Id = BankId
+    
     all_data = []
     num_batches = math.ceil(total_count / BATCH_SIZE)
     failed_batches = []
     data_lock = Lock()
     
     print(f"\n{'='*70}")
-    print(f"Starting PARALLEL batch fetch")
+    print(f"Starting PARALLEL MNRL Reactivated batch fetch")
     print(f"Total records: {total_count}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Number of batches: {num_batches}")
     print(f"Parallel workers: {max_workers}")
-    print(f"Estimated time: ~{(num_batches * 3) / max_workers:.0f}s (vs ~{num_batches * 10:.0f}s sequential)")
     print(f"{'='*70}\n")
     
     def fetch_single_batch(batch_num):
@@ -265,7 +593,7 @@ def fetch_and_decrypt_all(key_id: str, total_count: int, date: str, client_id: s
         
         try:
             # Fetch encrypted payload
-            encrypted_payload = fri_data(key_id, current_batch_size, offset, date, client_id)
+            encrypted_payload = mnrl_data_reactivated(key_id, current_batch_size, offset, date, Bank_Id)
             
             # Decrypt
             decrypted_batch = decrypt_data(encrypted_payload)
@@ -273,11 +601,15 @@ def fetch_and_decrypt_all(key_id: str, total_count: int, date: str, client_id: s
             # Parse
             records = []
             if isinstance(decrypted_batch, str):
-                decrypted_json = json.loads(decrypted_batch)
-                if isinstance(decrypted_json, dict) and "data" in decrypted_json:
-                    records = decrypted_json["data"]
-                elif isinstance(decrypted_json, list):
-                    records = decrypted_json
+                try:
+                    decrypted_json = json.loads(decrypted_batch)
+                    if isinstance(decrypted_json, dict) and "data" in decrypted_json:
+                        records = decrypted_json["data"]
+                    elif isinstance(decrypted_json, list):
+                        records = decrypted_json
+                except json.JSONDecodeError as e:
+                    print(f"[Batch-{batch_num+1}] JSON parse error: {e}")
+                    return None
             elif isinstance(decrypted_batch, list):
                 records = decrypted_batch
             
@@ -335,6 +667,9 @@ def save_to_excel(data: list, filename, columns: list):
     
     if available_columns:
         df = df[available_columns]
+    else:
+        print(f"Warning: None of the specified columns {columns} found in data")
+        print(f"Available columns: {list(df.columns)}")
     
     df.to_excel(filename, index=False, engine='openpyxl')
     

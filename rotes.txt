@@ -1,64 +1,28 @@
-from flask import Blueprint, request, jsonify, send_file, Response
-from crypto_utils import encrypt_data, decrypt_data
-from FRI import fri_auth, fri_count, fri_data, fetch_and_decrypt_all, save_to_excel
-from MNRL import mnrl_auth, mnrl_count, mnrl_data, mnrl_count_reactivated, mnrl_data_reactivated_excel
-from dataverse import create_row_file, read_row, download_file
+# Add these imports at the top if not already there
 import io
 import traceback
+from flask import send_file
 
-routes = Blueprint("routes", __name__)
+# ... existing routes ...
 
-
-@routes.route("/health", methods=["GET"])
-def health():
-    return {"status": "API is working"}, 200
-
-
-@routes.route("/encrypt", methods=["POST"])
-def encrypt():
+@routes.route("/mnrl/auth", methods=["POST"])
+def auth_mnrl():
     try:
-        key_id = request.headers.get("X-PUBLIC-KEY-ID")
-        if not key_id:
-            return {"error": "X-PUBLIC-KEY-ID header required"}, 400
-        
-        payload = request.json
-        result = encrypt_data(payload, key_id)
-        
-        return jsonify(result), 200
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/decrypt", methods=["POST"])
-def decrypt():
-    try:
-        payload = request.json
-        result = decrypt_data(payload)
-        return jsonify(result), 200
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/fri/auth", methods=["POST"])
-def auth():
-    try:
-        key_id = "FRI"
+        key_id = "DIU"
         if not key_id:
             return {"error": "KEY-ID is required"}, 400
         
-        response = fri_auth(key_id)
+        response = mnrl_auth(key_id)
         return {"token": response}, 200
     except Exception as e:
         print(traceback.format_exc())
         return {"error": str(e)}, 500
 
 
-@routes.route("/fri/count", methods=["POST"])
-def count():
+@routes.route("/mnrl/count", methods=["POST"])
+def count_mnrl():
     try:
-        key_id = "FRI"
+        key_id = "DIU"
         if not key_id:
             return {"error": "KEY-ID is required"}, 400
         
@@ -67,76 +31,50 @@ def count():
         if not req.get("date"):
             return {"error": "date is required"}, 400
         
-        response = fri_count(
+        response = mnrl_count(
             key_id=key_id,
             count_date=req.get("date")
         )
         
-        print(f"Count response: {response}")
+        print(f"MNRL Count response: {response}")
         return response, 200
     except Exception as e:
-        print(f"Error in /fri/count: {str(e)}")
+        print(f"Error in /mnrl/count: {str(e)}")
         print(traceback.format_exc())
         return {"error": str(e)}, 500
 
 
-@routes.route("/fri/data/test", methods=["POST"])
-def data_test():
+@routes.route("/mnrl/data", methods=["POST"])
+def data_mnrl():
     try:
-        key_id = "FRI"
+        key_id = "DIU"
         if not key_id:
             return {"error": "KEY-ID is required"}, 400
         
         req = request.json
         
-        # Validate required fields
-        required_fields = ["date", "offset", "count", "client_id"]
-        for field in required_fields:
-            if req.get(field) is None:
-                return {"error": f"{field} is required"}, 400
-        
-        response = fri_data(
-            key_id=key_id,
-            date=req.get("date"),
-            offset=req.get("offset"),
-            count=req.get("count"),
-            client_id=req.get("client_id")
-        )
-        
-        return response, 200
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/fri/data", methods=["POST"])
-def data():
-    try:
-        key_id = "FRI"
-        if not key_id:
-            return {"error": "KEY-ID is required"}, 400
-        
-        req = request.json
-        
-        # Validate required fields
         if not req.get("date"):
             return {"error": "date is required"}, 400
-        if not req.get("client_id"):
-            return {"error": "client_id is required"}, 400
         
         # Get count first
-        count_res = fri_count(key_id=key_id, count_date=req.get("date"))
+        count_res = mnrl_count(
+            key_id=key_id,
+            count_date=req.get("date")
+        )
+        
         total_count = count_res.get("count", 0)
+        print(f"MNRL count: {total_count}")
         
         if total_count == 0:
             return {"error": "No records found for this date", "count": 0}, 404
         
-        response = fetch_and_decrypt_all(
+        response = mnrl_data(
             key_id=key_id,
             total_count=total_count,
             date=req.get("date"),
-            client_id=req.get("client_id"),
-            BATCH_SIZE=req.get("batch_size", 1000)  # Allow custom batch size
+            BATCH_SIZE=req.get("batch_size", 2000),  # Allow custom batch size
+            Bank_Id=req.get("BankId"),
+            max_workers=req.get("max_workers", 5)  # Allow custom workers
         )
         
         return {"data": response, "total_records": len(response)}, 200
@@ -145,62 +83,57 @@ def data():
         return {"error": str(e)}, 500
 
 
-@routes.route("/fri/data/excel", methods=["POST"])
-def data_excel():
+@routes.route("/mnrl/data/excel", methods=["POST"])
+def data_excel_mnrl():
     try:
-        key_id = "FRI"
+        key_id = "DIU"
         if not key_id:
             return {"error": "KEY-ID is required"}, 400
         
         req = request.json
         
-        # Validate required fields
         if not req.get("date"):
             return {"error": "date is required"}, 400
         
-        client_id = req.get("client_id", "123412114")  # Default client ID
-        batch_size = req.get("batch_size", 1000)  # Default batch size
-        
         print(f"\n{'='*70}")
-        print(f"Excel Export Request")
+        print(f"MNRL Excel Export Request")
         print(f"Date: {req.get('date')}")
-        print(f"Client ID: {client_id}")
-        print(f"Batch Size: {batch_size}")
         print(f"{'='*70}\n")
         
         # Get count
-        count_res = fri_count(
+        count_res = mnrl_count(
             key_id=key_id,
             count_date=req.get("date")
         )
         
         total_count = count_res.get("count", 0)
-        print(f"Total count from API: {total_count}")
+        print(f"Total MNRL count: {total_count}")
         
         if total_count == 0:
             return {"error": "No records found for this date", "count": 0}, 404
         
         # Fetch and decrypt all data
-        response = fetch_and_decrypt_all(
+        response = mnrl_data(
             key_id=key_id,
             total_count=total_count,
             date=req.get("date"),
-            client_id=client_id,
-            BATCH_SIZE=batch_size
+            BATCH_SIZE=req.get("batch_size", 2000),
+            Bank_Id=req.get("BankId"),
+            max_workers=req.get("max_workers", 5)
         )
         
         if not response:
             return {"error": "No data retrieved", "count": 0}, 404
         
         # Prepare Excel file
-        columns = ['fri', 'isa_id', 'mobile_no', 'status', 'tsp_id']
+        columns = ['date_of_disconnection', 'disconnection_reason_id', 'lsa_id', 'mobile_no', 'tsp_id']
         output = io.BytesIO()
         
         print(f"\nGenerating Excel file with {len(response)} records...")
         save_to_excel(response, output, columns)
         output.seek(0)
         
-        filename = f"fri_data_{req.get('date')}_{len(response)}_records.xlsx"
+        filename = f"mnrl_data_{req.get('date')}_{len(response)}_records.xlsx"
         
         print(f"✓ Excel file ready: {filename}\n")
         
@@ -212,106 +145,137 @@ def data_excel():
         )
         
     except Exception as e:
-        print(f"\n✗ Error in /fri/data/excel:")
+        print(f"\n✗ Error in /mnrl/data/excel:")
         print(traceback.format_exc())
         return {"error": str(e)}, 500
 
 
-@routes.route("/dataverse/save", methods=["POST"])
-def upload_file():
+@routes.route("/mnrl/count/reactivated", methods=["POST"])
+def count_mnrl_reactivated():
     try:
-        file = request.files['file']  # FileStorage object
-        record_count = request.form['record_count']
-        export_date = request.form['export_date']
-        form_type = request.form['type'].upper()  # MNRL or FRI
+        key_id = "DIU"
+        if not key_id:
+            return {"error": "KEY-ID is required"}, 400
         
-        print(f"Upload request - Type: {form_type}, Records: {record_count}, Date: {export_date}")
+        req = request.json
         
-        # Read file contents
-        contents = file.read()
-        filename = file.filename
+        if not req.get("date"):
+            return {"error": "date is required"}, 400
         
-        row = {
-            'cr1d9_recordcount': record_count,
-            'cr1d9_exportdate': export_date
-        }
-        
-        if form_type == 'FRI':
-            if not record_count or not export_date:
-                return {"error": "Missing FRI fields"}, 400
-            table_name = 'cr1d9_fri_downloads'
-            
-        elif form_type == 'MNRL':
-            data_type = request.form.get('data_type')
-            if not record_count or not export_date or not data_type:
-                return {"error": "Missing MNRL fields"}, 400
-            row['cr1d9_datatype'] = data_type
-            table_name = 'cr1d9_mnrl_downloads'
-        else:
-            return {"error": f"Invalid type: {form_type}"}, 400
-        
-        # Call backend logic
-        result = create_row_file(
-            table_name=table_name,
-            row=row,
-            file_col_name='cr1d9_file',
-            filename=filename,
-            contents=contents
+        response = mnrl_count_reactivated(
+            key_id=key_id,
+            count_date=req.get("date")
         )
         
-        return jsonify({'success': True, 'result': result})
+        print(f"MNRL Reactivated Count response: {response}")
+        return response, 200
+    except Exception as e:
+        print(f"Error in /mnrl/count/reactivated: {str(e)}")
+        print(traceback.format_exc())
+        return {"error": str(e)}, 500
+
+
+@routes.route("/mnrl/data/reactivated", methods=["POST"])
+def data_mnrl_reactivated():
+    try:
+        key_id = "DIU"
+        if not key_id:
+            return {"error": "KEY-ID is required"}, 400
         
+        req = request.json
+        
+        if not req.get("date"):
+            return {"error": "date is required"}, 400
+        
+        # Get count first
+        count_res = mnrl_count_reactivated(
+            key_id=key_id,
+            count_date=req.get("date")
+        )
+        
+        total_count = count_res.get("count", 0)
+        print(f"MNRL reactivated count: {total_count}")
+        
+        if total_count == 0:
+            return {"error": "No records found for this date", "count": 0}, 404
+        
+        response = mnrl_data_reactivated_excel(
+            key_id=key_id,
+            total_count=total_count,
+            date=req.get("date"),
+            BATCH_SIZE=req.get("batch_size", 2000),
+            Bank_Id=req.get("BankId"),
+            max_workers=req.get("max_workers", 5)
+        )
+        
+        return {"data": response, "total_records": len(response)}, 200
     except Exception as e:
         print(traceback.format_exc())
         return {"error": str(e)}, 500
 
 
-@routes.route("/dataverse/list", methods=["GET"])
-def list_files():
+@routes.route("/mnrl/data/reactivated/excel", methods=["POST"])
+def data_excel_mnrl_reactivated():
     try:
-        req_type = request.args.get('type', 'FRI').upper()
+        key_id = "DIU"
+        if not key_id:
+            return {"error": "KEY-ID is required"}, 400
         
-        if req_type == 'FRI':
-            table_name = 'cr1d9_fri_downloads'
-        elif req_type == 'MNRL':
-            table_name = 'cr1d9_mnrl_downloads'
-        else:
-            return {"error": f"Invalid type: {req_type}"}, 400
+        req = request.json
         
-        result = read_row(table_name=table_name)
-        return jsonify(result)
+        if not req.get("date"):
+            return {"error": "date is required"}, 400
         
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
-
-
-@routes.route("/dataverse/download/<fileId>", methods=["GET"])
-def download(fileId):
-    try:
-        req_type = request.args.get('type', 'FRI').upper()
+        print(f"\n{'='*70}")
+        print(f"MNRL Reactivated Excel Export Request")
+        print(f"Date: {req.get('date')}")
+        print(f"{'='*70}\n")
         
-        if req_type == 'FRI':
-            table_name = 'cr1d9_fri_downloads'
-        elif req_type == 'MNRL':
-            table_name = 'cr1d9_mnrl_downloads'
-        else:
-            return {"error": f"Invalid type: {req_type}"}, 400
-        
-        data, fileName = download_file(
-            table_name=table_name,
-            row_id=fileId,
-            file_col_name="cr1d9_file"
+        # Get count
+        count_res = mnrl_count_reactivated(
+            key_id=key_id,
+            count_date=req.get("date")
         )
         
-        return Response(
-            data,
-            mimetype="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{fileName}"'
-            }
+        total_count = count_res.get("count", 0)
+        print(f"Total MNRL reactivated count: {total_count}")
+        
+        if total_count == 0:
+            return {"error": "No records found for this date", "count": 0}, 404
+        
+        # Fetch and decrypt all data
+        response = mnrl_data_reactivated_excel(
+            key_id=key_id,
+            total_count=total_count,
+            date=req.get("date"),
+            BATCH_SIZE=req.get("batch_size", 2000),
+            Bank_Id=req.get("BankId"),
+            max_workers=req.get("max_workers", 5)
+        )
+        
+        if not response:
+            return {"error": "No data retrieved", "count": 0}, 404
+        
+        # Prepare Excel file
+        columns = ['date_of_reactivation', 'mobile_no', 'reactivation_id']
+        output = io.BytesIO()
+        
+        print(f"\nGenerating Excel file with {len(response)} records...")
+        save_to_excel(response, output, columns)
+        output.seek(0)
+        
+        filename = f"mnrl_reactivated_{req.get('date')}_{len(response)}_records.xlsx"
+        
+        print(f"✓ Excel file ready: {filename}\n")
+        
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=filename
         )
         
     except Exception as e:
+        print(f"\n✗ Error in /mnrl/data/reactivated/excel:")
         print(traceback.format_exc())
         return {"error": str(e)}, 500
