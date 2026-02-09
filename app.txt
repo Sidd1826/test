@@ -1,18 +1,18 @@
 import json
-import argparse
 import os
-import base64
 import requests
 import math
 import pandas as pd
 import time
 import urllib3
+import concurrent.futures
 from crypto_utils import encrypt_data, decrypt_data
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from threading import Lock
 
-# Disable SSL warnings since we're using verify=False
+# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Token cache
@@ -20,9 +20,11 @@ _token_cache = {
     'token': None,
     'expires_at': None
 }
+_token_lock = Lock()
 
-# Session with retry logic
+# Session
 _session = None
+_session_lock = Lock()
 
 def get_session_with_retries():
     """Create a requests session with retry logic and connection pooling"""
@@ -31,127 +33,102 @@ def get_session_with_retries():
     if _session is not None:
         return _session
     
-    session = requests.Session()
-    
-    retry_strategy = Retry(
-        total=5,  # Total number of retries
-        backoff_factor=2,  # Wait 1, 2, 4, 8, 16 seconds between retries
-        status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
-        allowed_methods=["POST", "GET"]
-    )
-    
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=10,
-        pool_maxsize=10,
-        pool_block=False
-    )
-    
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    
-    _session = session
-    return session
+    with _session_lock:
+        if _session is not None:
+            return _session
+        
+        session = requests.Session()
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,  # Increased for parallel
+            pool_maxsize=20,
+            pool_block=False
+        )
+        
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        _session = session
+        return session
 
 
 def fri_auth(key_id: str, force_refresh=False) -> str:
-    """
-    Authenticate with FRI API and cache the token
-    
-    Args:
-        key_id: The encryption key ID
-        force_refresh: Force a new token even if cached one is valid
-        
-    Returns:
-        Authentication token string
-    """
+    """Authenticate with FRI API and cache the token (thread-safe)"""
     global _token_cache
     
-    # Return cached token if valid and not forcing refresh
-    if not force_refresh and _token_cache['token'] and _token_cache['expires_at']:
-        if datetime.now() < _token_cache['expires_at']:
-            print("Using cached token")
-            return _token_cache['token']
-    
-    print("Fetching new authentication token...")
-    
-    payload = {
-        "email": os.getenv("FRI_EMAIL"),
-        "password": os.getenv("FRI_PASSWORD")
-    }
-    
-    if not payload["email"] or not payload["password"]:
-        raise ValueError("FRI_EMAIL and FRI_PASSWORD environment variables must be set")
-    
-    encrypted_payload = encrypt_data(payload, key_id)
-    
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
-    AUTH_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/auth"
-    
-    session = get_session_with_retries()
-    
-    try:
-        response = session.post(
-            AUTH_URL,
-            json=encrypted_payload,
-            headers=headers,
-            timeout=30,
-            verify=False
-        )
+    with _token_lock:
+        # Return cached token if valid
+        if not force_refresh and _token_cache['token'] and _token_cache['expires_at']:
+            if datetime.now() < _token_cache['expires_at']:
+                return _token_cache['token']
         
-        response.raise_for_status()
+        print("Fetching new authentication token...")
         
-        if not response.text:
-            raise ValueError("Empty response from auth API")
+        payload = {
+            "email": os.getenv("FRI_EMAIL"),
+            "password": os.getenv("FRI_PASSWORD")
+        }
         
-        res = response.json()
-        token = res.get('token')
+        if not payload["email"] or not payload["password"]:
+            raise ValueError("FRI_EMAIL and FRI_PASSWORD environment variables must be set")
         
-        if not token:
-            raise ValueError(f"No token in response. Response: {res}")
+        encrypted_payload = encrypt_data(payload, key_id)
         
-        # Cache the token
-        _token_cache['token'] = token
-        _token_cache['expires_at'] = datetime.now() + timedelta(minutes=120)
+        headers = {
+            "Content-Type": "application/json"
+        }
         
-        print("✓ Authentication successful")
-        return token
+        AUTH_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/auth"
         
-    except requests.exceptions.RequestException as e:
-        print(f"✗ Auth API Error: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response status: {e.response.status_code}")
-            print(f"Response body: {e.response.text}")
-        raise
-    except json.JSONDecodeError as e:
-        print(f"✗ Auth JSON Decode Error: {e}")
-        print(f"Response text: {response.text}")
-        raise ValueError(f"Invalid JSON response from auth API: {response.text[:500]}")
+        session = get_session_with_retries()
+        
+        try:
+            response = session.post(
+                AUTH_URL,
+                json=encrypted_payload,
+                headers=headers,
+                timeout=30,
+                verify=False
+            )
+            
+            response.raise_for_status()
+            
+            if not response.text:
+                raise ValueError("Empty response from auth API")
+            
+            res = response.json()
+            token = res.get('token')
+            
+            if not token:
+                raise ValueError(f"No token in response. Response: {res}")
+            
+            # Cache the token
+            _token_cache['token'] = token
+            _token_cache['expires_at'] = datetime.now() + timedelta(minutes=120)
+            
+            print("✓ Authentication successful")
+            return token
+            
+        except Exception as e:
+            print(f"✗ Auth API Error: {e}")
+            raise
 
 
 def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
-    """
-    Get count of records for a specific date
-    
-    Args:
-        key_id: The encryption key ID
-        count_date: Date in YYYY-MM-DD format
-        max_retries: Maximum number of retry attempts
-        
-    Returns:
-        Dictionary with count and date
-    """
+    """Get count of records for a specific date"""
     session = get_session_with_retries()
     
     for attempt in range(max_retries):
         try:
             token = fri_auth(key_id, force_refresh=(attempt > 0))
-            
-            if not token:
-                raise ValueError("Failed to retrieve FRI auth token")
             
             headers = {
                 "Content-Type": "application/json",
@@ -161,8 +138,6 @@ def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
             body = {"date": count_date}
             FRI_COUNT_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/count"
             
-            print(f"Fetching count for date: {count_date} (attempt {attempt + 1}/{max_retries})")
-            
             response = session.post(
                 FRI_COUNT_URL,
                 json=body,
@@ -171,97 +146,44 @@ def fri_count(key_id: str, count_date: str, max_retries=3) -> dict:
                 verify=False
             )
             
-            # Log response details
-            print(f"Response Status: {response.status_code}")
-            
-            # Handle 401 Unauthorized (token expired)
-            if response.status_code == 401:
+            if response.status_code == 401 and attempt < max_retries - 1:
                 print("Token expired, refreshing...")
-                _token_cache['token'] = None
-                _token_cache['expires_at'] = None
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    raise ValueError("Authentication failed after retries")
-            
-            # Handle 429 Too Many Requests (rate limiting)
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 10))
-                print(f"Rate limited. Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                if attempt < max_retries - 1:
-                    continue
-                else:
-                    raise ValueError("Rate limit exceeded after retries")
+                with _token_lock:
+                    _token_cache['token'] = None
+                    _token_cache['expires_at'] = None
+                time.sleep(1)
+                continue
             
             response.raise_for_status()
             
-            # Check if response has content
-            if not response.text or response.text.strip() == '':
-                raise ValueError(f"Empty response from count API for date {count_date}")
+            if not response.text:
+                raise ValueError(f"Empty response from count API")
             
-            # Parse JSON
-            try:
-                result = response.json()
-                print(f"✓ Count retrieved: {result.get('count', 0)} records")
-                return result
-            except json.JSONDecodeError as e:
-                print(f"JSON Decode Error: {e}")
-                print(f"Response content: {response.text[:500]}")
-                raise ValueError(f"Invalid JSON response: {response.text[:500]}")
+            result = response.json()
+            print(f"✓ Count retrieved: {result.get('count', 0)} records")
+            return result
         
         except requests.exceptions.ConnectionError as e:
-            print(f"✗ Connection error on attempt {attempt + 1}: {e}")
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt)  # Exponential backoff
-                print(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                raise
-        
-        except requests.exceptions.Timeout as e:
-            print(f"✗ Timeout on attempt {attempt + 1}: {e}")
             if attempt < max_retries - 1:
                 wait_time = (2 ** attempt)
-                print(f"Retrying in {wait_time} seconds...")
+                print(f"Connection error, retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 raise
-        
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"✗ Count API Error: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response status: {e.response.status_code}")
-                print(f"Response body: {e.response.text}")
             raise
     
     raise ValueError(f"Failed to get count after {max_retries} attempts")
 
 
 def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, max_retries=3) -> dict:
-    """
-    Fetch FRI data with pagination
-    
-    Args:
-        key_id: The encryption key ID
-        count: Number of records to fetch
-        offset: Starting offset
-        date: Date in YYYY-MM-DD format
-        client_id: Client identifier
-        max_retries: Maximum number of retry attempts
-        
-    Returns:
-        Encrypted payload dictionary
-    """
+    """Fetch FRI data with pagination (optimized for parallel calls)"""
     session = get_session_with_retries()
     
     for attempt in range(max_retries):
         try:
-            token = fri_auth(key_id, force_refresh=(attempt > 0))
-            
-            if not token:
-                raise ValueError("Failed to retrieve FRI auth token")
+            token = fri_auth(key_id)
             
             headers = {
                 "Content-Type": "application/json",
@@ -277,217 +199,144 @@ def fri_data(key_id: str, count: int, offset: int, date: str, client_id: str, ma
             
             FRI_DATA_URL = "https://fritestgateway.sancharsaathi.gov.in/fri/v1/data"
             
-            print(f"  Fetching data - offset: {offset}, count: {count} (attempt {attempt + 1}/{max_retries})")
-            
             response = session.post(
                 FRI_DATA_URL,
                 json=body,
                 headers=headers,
-                timeout=90,  # Increased timeout for data fetch
+                timeout=45,  # Reduced timeout
                 verify=False
             )
             
-            # Handle 401 Unauthorized
-            if response.status_code == 401:
-                print("  Token expired, refreshing...")
-                _token_cache['token'] = None
-                _token_cache['expires_at'] = None
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    raise ValueError("Authentication failed after retries")
-            
-            # Handle 429 Too Many Requests
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 10))
-                print(f"  Rate limited. Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                if attempt < max_retries - 1:
-                    continue
-                else:
-                    raise ValueError("Rate limit exceeded after retries")
+            if response.status_code == 401 and attempt < max_retries - 1:
+                with _token_lock:
+                    _token_cache['token'] = None
+                    _token_cache['expires_at'] = None
+                time.sleep(1)
+                continue
             
             response.raise_for_status()
             
             if not response.text:
                 raise ValueError("Empty response from data API")
             
-            try:
-                result = response.json()
-                print(f"  ✓ Data fetched successfully")
-                return result
-            except json.JSONDecodeError as e:
-                print(f"  JSON Decode Error: {e}")
-                print(f"  Response content: {response.text[:500]}")
-                raise ValueError(f"Invalid JSON response: {response.text[:500]}")
+            return response.json()
         
         except requests.exceptions.ConnectionError as e:
-            print(f"  ✗ Connection error on attempt {attempt + 1}: {e}")
             if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 2  # Longer backoff for data fetch
-                print(f"  Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-                
-                # Refresh token on connection error
-                _token_cache['token'] = None
-                _token_cache['expires_at'] = None
-            else:
-                print(f"  ✗ Max retries reached for this batch")
-                raise
-        
-        except requests.exceptions.Timeout as e:
-            print(f"  ✗ Timeout on attempt {attempt + 1}: {e}")
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 2
-                print(f"  Retrying in {wait_time} seconds...")
+                wait_time = min(2 ** attempt, 4)  # Cap at 4 seconds
                 time.sleep(wait_time)
             else:
                 raise
-        
-        except requests.exceptions.RequestException as e:
-            print(f"  ✗ Data API Error: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"  Response status: {e.response.status_code}")
-                print(f"  Response body: {e.response.text[:500]}")
-            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                raise
     
     raise ValueError(f"Failed to fetch data after {max_retries} attempts")
 
 
-def fetch_and_decrypt_all(key_id: str, total_count: int, date: str, client_id: str, BATCH_SIZE: int = 1000) -> list:
+def fetch_and_decrypt_all(key_id: str, total_count: int, date: str, client_id: str, BATCH_SIZE: int = 2000, max_workers: int = 5) -> list:
     """
-    Fetch and decrypt all data in batches with rate limiting and error handling
+    Fetch and decrypt all data in PARALLEL batches
     
     Args:
-        key_id: The encryption key ID
-        total_count: Total number of records to fetch
-        date: Date in YYYY-MM-DD format
-        client_id: Client identifier
-        BATCH_SIZE: Number of records per batch (default: 1000)
-        
-    Returns:
-        List of all decrypted records
+        BATCH_SIZE: Increased default to 2000
+        max_workers: Number of parallel threads (default: 5)
     """
     all_data = []
     num_batches = math.ceil(total_count / BATCH_SIZE)
     failed_batches = []
+    data_lock = Lock()
     
     print(f"\n{'='*70}")
-    print(f"Starting batch fetch process")
+    print(f"Starting PARALLEL batch fetch")
     print(f"Total records: {total_count}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Number of batches: {num_batches}")
+    print(f"Parallel workers: {max_workers}")
+    print(f"Estimated time: ~{(num_batches * 3) / max_workers:.0f}s (vs ~{num_batches * 10:.0f}s sequential)")
     print(f"{'='*70}\n")
     
-    for batch_num in range(num_batches):
+    def fetch_single_batch(batch_num):
+        """Fetch and decrypt a single batch"""
         offset = batch_num * BATCH_SIZE
         current_batch_size = min(BATCH_SIZE, total_count - offset)
-        
-        print(f"{'─'*70}")
-        print(f"Batch {batch_num + 1}/{num_batches}")
-        print(f"Offset: {offset}, Size: {current_batch_size}")
-        print(f"{'─'*70}")
         
         try:
             # Fetch encrypted payload
             encrypted_payload = fri_data(key_id, current_batch_size, offset, date, client_id)
             
-            # Decrypt the batch
-            print(f"  Decrypting batch...")
+            # Decrypt
             decrypted_batch = decrypt_data(encrypted_payload)
             
-            # Parse records
+            # Parse
             records = []
             if isinstance(decrypted_batch, str):
-                try:
-                    decrypted_json = json.loads(decrypted_batch)
-                    
-                    if isinstance(decrypted_json, dict) and "data" in decrypted_json:
-                        records = decrypted_json["data"]
-                    elif isinstance(decrypted_json, list):
-                        records = decrypted_json
-                    else:
-                        print(f"  Warning: Unexpected JSON structure: {type(decrypted_json)}")
-                        print(f"  Keys: {list(decrypted_json.keys()) if isinstance(decrypted_json, dict) else 'N/A'}")
-                        
-                except json.JSONDecodeError as e:
-                    print(f"  ✗ Error parsing decrypted batch JSON: {e}")
-                    print(f"  First 200 chars: {decrypted_batch[:200]}")
-                    failed_batches.append(batch_num)
-                    
+                decrypted_json = json.loads(decrypted_batch)
+                if isinstance(decrypted_json, dict) and "data" in decrypted_json:
+                    records = decrypted_json["data"]
+                elif isinstance(decrypted_json, list):
+                    records = decrypted_json
             elif isinstance(decrypted_batch, list):
                 records = decrypted_batch
-            else:
-                print(f"  Warning: Decrypted batch is unexpected type: {type(decrypted_batch)}")
-                failed_batches.append(batch_num)
             
-            if records:
-                all_data.extend(records)
-                print(f"  ✓ Batch {batch_num + 1} complete: {len(records)} records added")
-                print(f"  Running total: {len(all_data)}/{total_count} records")
-            else:
-                print(f"  ⚠ Batch {batch_num + 1} returned no records")
-                failed_batches.append(batch_num)
-            
-            # Rate limiting: delay between batches
-            if batch_num < num_batches - 1:  # Don't delay after last batch
-                delay = 2  # 2 seconds between batches
-                print(f"  Waiting {delay}s before next batch...")
-                time.sleep(delay)
+            return records if records else None
         
         except Exception as e:
-            print(f"  ✗ Error in batch {batch_num + 1}: {type(e).__name__}: {e}")
-            failed_batches.append(batch_num)
+            print(f"[Batch-{batch_num+1}] ✗ Error: {e}")
+            return None
+    
+    # Parallel execution
+    start_time = time.time()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {executor.submit(fetch_single_batch, i): i for i in range(num_batches)}
+        
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_batch):
+            batch_num = future_to_batch[future]
+            completed += 1
             
-            # Continue with next batch instead of stopping
-            print(f"  Continuing with next batch...")
-            time.sleep(5)  # Longer delay after error
-            
-            # Optionally, uncomment to stop on first error:
-            # raise
+            try:
+                records = future.result()
+                if records:
+                    with data_lock:
+                        all_data.extend(records)
+                    print(f"✓ Progress: {completed}/{num_batches} ({len(all_data)}/{total_count} records)")
+                else:
+                    failed_batches.append(batch_num)
+                    print(f"⚠ Batch {batch_num+1} failed")
+                    
+            except Exception as e:
+                failed_batches.append(batch_num)
+                print(f"✗ Batch {batch_num+1} exception: {e}")
+    
+    elapsed_time = time.time() - start_time
     
     print(f"\n{'='*70}")
-    print(f"Batch fetch process complete")
-    print(f"Total records fetched: {len(all_data)}/{total_count}")
-    print(f"Success rate: {((num_batches - len(failed_batches)) / num_batches * 100):.1f}%")
-    
+    print(f"✓ Complete in {elapsed_time:.1f}s (avg {elapsed_time/num_batches:.1f}s/batch)")
+    print(f"Records: {len(all_data)}/{total_count} ({len(all_data)/total_count*100:.1f}%)")
     if failed_batches:
-        print(f"⚠ Failed batches: {failed_batches}")
-    else:
-        print(f"✓ All batches processed successfully")
-    
+        print(f"⚠ Failed: {failed_batches}")
     print(f"{'='*70}\n")
     
     return all_data
 
 
 def save_to_excel(data: list, filename, columns: list):
-    """
-    Save data to Excel file
-    
-    Args:
-        data: List of records
-        filename: Output file path or BytesIO object
-        columns: List of column names to include
-    """
+    """Save data to Excel file"""
     if not data:
         print("No data to save.")
         return
     
     df = pd.DataFrame(data)
-    
-    # Reorder and filter columns if they exist
     available_columns = [col for col in columns if col in df.columns]
+    
     if available_columns:
         df = df[available_columns]
-    else:
-        print(f"Warning: None of the specified columns {columns} found in data")
-        print(f"Available columns: {list(df.columns)}")
     
     df.to_excel(filename, index=False, engine='openpyxl')
     
     if isinstance(filename, str):
-        print(f"✓ Data saved to {filename}")
-        print(f"  Columns: {list(df.columns)}")
-        print(f"  Rows: {len(df)}")
+        print(f"✓ Saved {len(df)} records to {filename}")
