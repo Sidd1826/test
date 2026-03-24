@@ -1,243 +1,484 @@
+"""
+BigQuery → Mobile Cleanup → Azure Blob Storage  |  Parquet Pipeline
+---------------------------------------------------------------------
+Flow:
+  1. COUNT total rows from BigQuery (ZBTEN3 partition)
+  2. Fetch all rows in 5-lakh LIMIT/OFFSET batches (3 retries each)
+  3. For every row, clean ZBTEN3 using the mobile cleanup utility
+     - Uses COUNTRY_RES column from BQ if present, else defaults to 'IN'
+  4. Append cleaned columns to each row (all original columns preserved)
+  5. Write everything into ONE snappy-compressed Parquet file in memory
+  6. Upload to Azure Blob Storage
+
+Output columns (original BQ cols + these appended):
+    final_mobile       : cleaned 12-digit number, or '' if invalid
+    final_mobile_flag  : 'Indian SMS' | 'International SMS' | ''
+    mobile_code        : country dialling code extracted
+    mobile_series      : 2-digit series after country code
+"""
+
 import io
-import os
-import math
-import json
+import logging
+import re
 import time
-import traceback
-import concurrent.futures
-from threading import Lock
+from typing import Optional
 
-import pandas as pd
-from flask import request, stream_with_context, Response
+import pyarrow as pa
+import pyarrow.parquet as pq
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from azure.storage.blob import BlobServiceClient
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG  –  edit these values before running
+# ═══════════════════════════════════════════════════════════════
+
+SERVICE_ACCOUNT_FILE = r"C:\Development\inm-gcp-service\serviceAccount.json"
+KMS_KEY_NAME         = (
+    "projects/hsbc-6320774-kms-prod/locations/asia-south1"
+    "/keyRings/bigQuery/cryptoKeys/HSMbqSharedKey"
+)
+
+BQ_TABLE          = "hsbc-12123686-1ndp-prod.IN_MDL_HUB_MAIN_PROD.HUB_SSADORP_RETN"
+PARTITION_FILTER  = "PARTI_MONTH = date '2026-03-01'"
+DISTINCT_KEY_COL  = "ZBTEN3"
+
+BATCH_SIZE          = 500_000   # 5 lakh rows per page
+MAX_RETRIES         = 3
+RETRY_DELAY_SECONDS = 5
+
+AZURE_CONNECTION_STR = "YOUR_AZURE_CONNECTION_STRING"   # ← replace
+AZURE_CONTAINER_NAME = "your-container"                 # ← replace
+AZURE_BLOB_NAME      = "output/bq_mobile_cleaned.parquet"
+
+DEFAULT_COUNTRY_RES  = "IN"   # fallback if no COUNTRY_RES column in BQ
+
+# ═══════════════════════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Core: Fetch & decrypt all MNRL data in parallel batches
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════
+# ── MOBILE CLEANUP UTILITY ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
-def mnrl_data(
-    key_id: str,
-    total_count: int,
-    date: str,
-    BATCH_SIZE: int = 2000,
-    Bank_Id: str = None,
-    max_workers: int = 5
-) -> list:
-    """Fetch and decrypt all MNRL data in parallel batches."""
+INDIAN_2D = {
+    "60","61","62","63","64","65","66","67","68","69",
+    "70","71","72","73","74","75","76","77","78","79",
+    "80","81","82","83","84","85","86","87","88","89",
+    "90","91","92","93","94","95","96","97","98","99",
+}
 
-    if Bank_Id is None:
-        Bank_Id = BankId  # assumes BankId is defined in outer scope
+INDIAN_800_SERIES = {"801", "805", "808", "809", "800"}
 
-    all_data = []
-    num_batches = math.ceil(total_count / BATCH_SIZE)
-    failed_batches = []
-    data_lock = Lock()
+INTL_COUNTRY_CONFIG = {
+    "971": 12, "966": 12, "974": 11, "973": 11,
+    "968": 11, "965": 11, "852": 11, "44":  12, "65": 10,
+}
 
-    print(f"\n{'*' * 70}")
-    print(f"Starting PARALLEL MNRL batch fetch")
-    print(f"Total records:     {total_count}")
-    print(f"Batch size:        {BATCH_SIZE}")
-    print(f"Number of batches: {num_batches}")
-    print(f"Parallel workers:  {max_workers}")
-    print(f"{'*' * 70}\n")
+INTL_VALID_SERIES = {
+    "973": {"36","38","39"},
+    "965": {"92","95","99","89"},
+    "968": {"92","95","99","89"},
+    "974": {"50","51","52","53","54","55","56","57","58"},
+    "966": {"50","53","54","55","56"},
+    "971": {"50","55","56"},
+    "852": {
+        "17","41","45","48","49","60","61","62","63","64",
+        "65","66","67","68","69","90","91","92","93","94",
+        "95","96","97","98","81","82","83","85",
+    },
+    "65":  {"90","91","92","93","94","96","97","98","81","82","83","85"},
+    "44":  {"74","75","77","78","79"},
+    "61":  {"40","41","42","43"},
+}
 
-    def fetch_single_batch(batch_num: int):
-        """Fetch and decrypt a single batch."""
-        offset = batch_num * BATCH_SIZE                          # fix: defined before use
-        current_batch_size = min(BATCH_SIZE, total_count - offset)
+COUNTRY_CODE_MAP = {
+    "AE":"971","SA":"966","QA":"974","BH":"973",
+    "OM":"968","KW":"965","HK":"852","SG":"65","GB":"44",
+}
+INTL_COUNTRIES = set(COUNTRY_CODE_MAP.keys())
 
+
+def _strip_special_chars(number: str) -> str:
+    delimiters = ["/", "\\", ",", " or ", "&", "X", ";", "(", "*", "//", "-"]
+    for delim in delimiters:
+        idx = number.find(delim)
+        if idx > 0:
+            number = number[:idx]
+    number = number.replace(" ", "")
+    number = re.sub(r"[^0-9+]", "", number)
+    number = re.sub(r"^[^0-9]", "", number)
+    return number.strip()
+
+
+def _normalise_intl_number(number: str, country_code: str) -> str:
+    cc_len   = len(country_code)
+    expected = INTL_COUNTRY_CONFIG[country_code]
+    sub_len  = expected - cc_len
+
+    prefix_map = [
+        (f"0000{country_code}", 4 + cc_len + sub_len),
+        (f"000{country_code}",  3 + cc_len + sub_len),
+        (f"00{country_code}",   2 + cc_len + sub_len),
+        (f"0{country_code}",    1 + cc_len + sub_len),
+        (country_code,          expected),
+    ]
+    for prefix, total_len in prefix_map:
+        if number.startswith(prefix):
+            return number[len(prefix) - cc_len:] if len(number) == total_len else ""
+    return ""
+
+
+def _clean_indian_domestic(raw: str) -> str:
+    if not raw:
+        return ""
+    number = _strip_special_chars(raw.strip())
+    number = re.sub(r"[^0-9]", "", number)
+    if not number:
+        return ""
+
+    for prefix, expected_total in [
+        ("000919",16),("00919",15),("0919",14),("919",13),
+        ("000918",16),("00918",15),("0918",14),("918",13),
+        ("000917",16),("00917",15),("0917",14),("917",13),
+        ("000916",16),("00916",15),("0916",14),("916",13),
+    ]:
+        if number.startswith(prefix) and len(number) == expected_total:
+            number = number[len(prefix) - 2:]
+            break
+
+    for prefix in [
+        "090","091","092","093","094","095","096","097","098","099",
+        "081","082","083","084","085","086","087","088","089",
+        "070","071","072","073","074","075","076","077","078","079",
+        "060","061","062","063","064","065","066","067","068","069",
+        "0801","0805","0808","0809","0800",
+    ]:
+        if number.startswith(prefix):
+            if len(number) == 11:
+                number = number[1:]
+            elif len(number) != 10:
+                number = ""
+            break
+
+    if len(number) != 10:
+        return ""
+
+    if number[:2] in INDIAN_2D or number[:3] in INDIAN_800_SERIES:
+        return "91" + number
+    return ""
+
+
+def _clean_international(raw: str, country_res: str) -> str:
+    if not raw or not country_res:
+        return ""
+    number = re.sub(r"[^0-9+]", "", raw.strip())
+    if number.startswith("+"):
+        number = number[1:]
+    number = re.sub(r"[^0-9]", "", number)
+    if not number:
+        return ""
+
+    cc = COUNTRY_CODE_MAP.get(country_res.strip().upper())
+    if not cc:
+        return ""
+
+    expected  = INTL_COUNTRY_CONFIG[cc]
+    canonical = _normalise_intl_number(number, cc)
+    if not canonical or len(canonical) != expected:
+        return ""
+
+    series = canonical[len(cc): len(cc) + 2]
+    valid_series = INTL_VALID_SERIES.get(cc, set())
+    if valid_series and series not in valid_series:
+        return ""
+
+    return canonical
+
+
+def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> dict:
+    """
+    Returns dict with keys:
+        final_mobile, final_mobile_flag, mobile_code, mobile_series
+    """
+    result = {
+        "final_mobile": "",
+        "final_mobile_flag": "",
+        "mobile_code": "",
+        "mobile_series": "",
+    }
+    if not raw_telno or not str(raw_telno).strip():
+        return result
+
+    raw        = str(raw_telno).strip()
+    country_res = (country_res or DEFAULT_COUNTRY_RES).strip().upper()
+
+    # International path
+    if country_res in INTL_COUNTRIES:
+        intl_mob = _clean_international(raw, country_res)
+        if intl_mob:
+            cc = COUNTRY_CODE_MAP[country_res]
+            result.update({
+                "final_mobile":      intl_mob,
+                "final_mobile_flag": "International SMS",
+                "mobile_code":       cc,
+                "mobile_series":     intl_mob[len(cc): len(cc) + 2],
+            })
+            return result
+
+    # Indian domestic path
+    domestic = _clean_indian_domestic(raw)
+    if domestic:
+        result.update({
+            "final_mobile":      domestic,
+            "final_mobile_flag": "Indian SMS",
+            "mobile_code":       "91",
+            "mobile_series":     domestic[2:4],
+        })
+        return result
+
+    # Fallback — try bare digit string
+    digits_only = re.sub(r"[^0-9]", "", raw)
+    if not re.search(r"[A-Za-z]", raw) and len(digits_only) in (10, 12):
+        candidate = digits_only if len(digits_only) == 12 else "91" + digits_only
+        if candidate.startswith("91") and candidate[2] in "6789":
+            result.update({
+                "final_mobile":      candidate,
+                "final_mobile_flag": "Indian SMS",
+                "mobile_code":       "91",
+                "mobile_series":     candidate[2:4],
+            })
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# ── BIGQUERY HELPERS ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+
+def _make_bq_client() -> bigquery.Client:
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    return bigquery.Client(credentials=credentials, project=credentials.project_id)
+
+
+def _make_job_config() -> bigquery.QueryJobConfig:
+    enc = bigquery.EncryptionConfiguration(kms_key_name=KMS_KEY_NAME)
+    return bigquery.QueryJobConfig(destination_encryption_configuration=enc)
+
+
+def run_query(client: bigquery.Client, query: str) -> list[dict]:
+    job = client.query(query, job_config=_make_job_config())
+    return [dict(row) for row in job.result()]
+
+
+def get_total_count(client: bigquery.Client) -> int:
+    query = f"""
+        SELECT COUNT(DISTINCT {DISTINCT_KEY_COL}) AS total
+        FROM   `{BQ_TABLE}`
+        WHERE  {PARTITION_FILTER}
+    """
+    log.info("Fetching total row count …")
+    rows  = run_query(client, query)
+    total = int(rows[0]["total"])
+    log.info("Total distinct rows: %d", total)
+    return total
+
+
+def fetch_batch_with_retry(
+    client: bigquery.Client,
+    offset: int,
+    batch_size: int,
+) -> list[dict]:
+    query = f"""
+        SELECT *
+        FROM   `{BQ_TABLE}`
+        WHERE  {PARTITION_FILTER}
+        LIMIT  {batch_size}
+        OFFSET {offset}
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # Fetch encrypted payload
-            encrypted_payload = mnrl_data_baseline(
-                key_id, current_batch_size, offset, date, Bank_Id
+            log.info(
+                "  Batch offset=%-8d  (attempt %d/%d)",
+                offset, attempt, MAX_RETRIES,
             )
+            rows = run_query(client, query)
+            log.info("  → fetched %d rows", len(rows))
+            return rows
+        except Exception as exc:          # noqa: BLE001
+            last_exc = exc
+            log.warning("  Attempt %d failed: %s", attempt, exc)
+            if attempt < MAX_RETRIES:
+                log.info("  Retrying in %ds …", RETRY_DELAY_SECONDS)
+                time.sleep(RETRY_DELAY_SECONDS)
 
-            # Decrypt
-            decrypted_batch = decrypt_data(encrypted_payload)
-
-            # Parse
-            records = []
-            if isinstance(decrypted_batch, str):
-                try:
-                    decrypted_json = json.loads(decrypted_batch)
-                    if isinstance(decrypted_json, dict) and "data" in decrypted_json:
-                        records = decrypted_json["data"]
-                    elif isinstance(decrypted_json, list):
-                        records = decrypted_json
-                except json.JSONDecodeError as e:
-                    print(f"[Batch-{batch_num + 1}] JSON parse error: {e}")
-                    return None
-            elif isinstance(decrypted_batch, list):
-                records = decrypted_batch
-
-            return records if records else None
-
-        except Exception as e:
-            print(f"[Batch-{batch_num + 1}] X Error: {e}")
-            return None
-
-    # --- Parallel execution ---
-    start_time = time.time()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_batch = {
-            executor.submit(fetch_single_batch, i): i
-            for i in range(num_batches)
-        }
-
-        completed = 0
-        for future in concurrent.futures.as_completed(future_to_batch):
-            batch_num = future_to_batch[future]
-            completed += 1
-
-            try:
-                records = future.result()
-                if records:
-                    with data_lock:
-                        all_data.extend(records)
-                    print(
-                        f"Progress: {completed}/{num_batches} "
-                        f"({len(all_data)}/{total_count} records)"
-                    )
-                else:
-                    failed_batches.append(batch_num)
-                    print(f"^ Batch {batch_num + 1} failed")
-            except Exception as e:
-                failed_batches.append(batch_num)
-                print(f"X Batch {batch_num + 1} exception: {e}")
-
-    elapsed_time = time.time() - start_time
-
-    print(f"\n{'-' * 70}")
-    print(f"Complete in {elapsed_time:.1f}s (avg {elapsed_time / num_batches:.1f}s/batch)")
-    print(f"Records: {len(all_data)}/{total_count} ({len(all_data) / total_count * 100:.1f}%)")
-    if failed_batches:
-        print(f"^ Failed batches: {failed_batches}")
-    print(f"{'*' * 70}\n")
-
-    return all_data
+    raise RuntimeError(
+        f"All {MAX_RETRIES} retries exhausted for offset={offset}"
+    ) from last_exc
 
 
-# ---------------------------------------------------------------------------
-# Helper: Write data to an in-memory BytesIO Excel buffer (chunked)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════
+# ── MOBILE CLEANUP ON A BATCH ───────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
-def write_excel_to_buffer(data: list, columns: list) -> io.BytesIO:
-    """Write data to an in-memory BytesIO object as an Excel file."""
-    output = io.BytesIO()
-    chunk_size = 5000
+def _apply_mobile_cleanup(rows: list[dict]) -> list[dict]:
+    """
+    For every row dict:
+      - Read ZBTEN3 as the raw mobile number
+      - Detect country_res from COUNTRY_RES column if present, else DEFAULT_COUNTRY_RES
+      - Append 4 cleaned columns to the row
+    All original columns are preserved unchanged.
+    """
+    # Check once whether the BQ result contains a COUNTRY_RES column
+    has_country_col = bool(rows) and "COUNTRY_RES" in rows[0]
 
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for i, chunk_start in enumerate(range(0, len(data), chunk_size)):
-            chunk = data[chunk_start:chunk_start + chunk_size]   # fix: defined before DataFrame
-            df_chunk = pd.DataFrame(chunk)
-
-            available_columns = [col for col in columns if col in df_chunk.columns]
-            if available_columns:
-                df_chunk = df_chunk[available_columns]
-
-            if i == 0:                                            # fix: == not =
-                df_chunk.to_excel(writer, index=False, sheet_name='Sheet1')
-            else:
-                df_chunk.to_excel(
-                    writer,
-                    index=False,
-                    sheet_name='Sheet1',
-                    startrow=chunk_start + 1,                     # fix: = not -
-                    header=False
-                )
-            del df_chunk
-            print(f"Written {min(chunk_start + chunk_size, len(data))} / {len(data)} rows...")
-
-    output.seek(0)
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Route: POST /mnrl/data/excel
-# ---------------------------------------------------------------------------
-
-@routes.route("/mnrl/data/excel", methods=["POST"])
-def data_excel_mnrl():
-    try:
-        key_id = "DIU"
-        if not key_id:
-            return {"error": "KEY-ID is required"}, 400
-
-        req = request.json
-        if not req or not req.get("date"):
-            return {"error": "date is required"}, 400
-
-        print(f"\n{'-' * 70}")
-        print(f"MNRL Excel Export Request")
-        print(f"Date: {req.get('date')}")
-        print(f"{'-' * 70}\n")
-
-        # --- Get total count ---
-        count_res = mnrl_count(
-            key_id=key_id,
-            count_date=req.get("date")
+    cleaned_rows = []
+    for row in rows:
+        raw_mobile  = str(row.get("ZBTEN3", "") or "")
+        country_res = (
+            str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
+            if has_country_col
+            else DEFAULT_COUNTRY_RES
         )
-        total_count = count_res.get("count", 0)
-        print(f"Total MNRL count: {total_count}")
+        mob = clean_mobile_number(raw_mobile, country_res)
+        cleaned_rows.append({
+            **row,
+            "final_mobile":      mob["final_mobile"],
+            "final_mobile_flag": mob["final_mobile_flag"],
+            "mobile_code":       mob["mobile_code"],
+            "mobile_series":     mob["mobile_series"],
+        })
+    return cleaned_rows
 
-        if total_count == 0:
-            return {"error": "No records found for this date", "count": 0}, 404
 
-        # --- Fetch & decrypt all records ---
-        response = mnrl_data(
-            key_id=key_id,
-            total_count=total_count,
-            date=req.get("date"),
-            BATCH_SIZE=req.get("batch_size", 3000),
-            Bank_Id=req.get("BankId"),
-            max_workers=req.get("max_workers", 5)
+# ═══════════════════════════════════════════════════════════════
+# ── PARQUET BUILDER ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+
+def batches_to_parquet_bytes(
+    client: bigquery.Client,
+    total_rows: int,
+) -> bytes:
+    """
+    Pages through BQ, cleans mobile numbers on each batch,
+    and streams everything into a single in-memory Parquet file.
+    """
+    sink          = pa.BufferOutputStream()
+    writer: Optional[pq.ParquetWriter] = None
+    total_written = 0
+    num_batches   = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+
+    log.info(
+        "Starting export: %d rows → %d batch(es) of %d",
+        total_rows, num_batches, BATCH_SIZE,
+    )
+
+    for batch_num in range(num_batches):
+        offset = batch_num * BATCH_SIZE
+
+        # 1. Fetch from BQ (with retry)
+        raw_rows = fetch_batch_with_retry(client, offset, BATCH_SIZE)
+        if not raw_rows:
+            log.info("  Empty batch at offset %d — stopping early.", offset)
+            break
+
+        # 2. Apply mobile cleanup
+        cleaned_rows = _apply_mobile_cleanup(raw_rows)
+
+        # 3. Write to parquet
+        table = pa.Table.from_pylist(cleaned_rows)
+        if writer is None:
+            writer = pq.ParquetWriter(sink, table.schema, compression="snappy")
+            log.info("  Parquet schema initialised with %d columns.", len(table.schema))
+
+        writer.write_table(table)
+        total_written += len(cleaned_rows)
+
+        valid_count = sum(1 for r in cleaned_rows if r["final_mobile"])
+        log.info(
+            "  Batch %d/%d  rows=%d  valid_mobile=%d  cumulative=%d",
+            batch_num + 1, num_batches,
+            len(cleaned_rows), valid_count, total_written,
         )
 
-        if not response:
-            return {"error": "No data retrieved", "count": 0}, 404
+    if writer is not None:
+        writer.close()
+        log.info("Parquet writer closed. Total rows written: %d", total_written)
+    else:
+        log.warning("No data written — writer never initialised.")
 
-        # --- Build Excel in memory ---
-        columns = [
-            'date_of_disconnection',
-            'disconnectionreason_id',
-            'lsa_id',
-            'mobile_no',
-            'tsp_id'
-        ]
-        filename = f"mnrl_data_{req.get('date')}_{len(response)}_records.xlsx"
+    return sink.getvalue().to_pybytes()
 
-        print(f"\nGenerating Excel file with {len(response)} records...")
-        output_buffer = write_excel_to_buffer(response, columns)
 
-        file_size = output_buffer.getbuffer().nbytes
-        print(f"Excel ready: {len(response)} rows | {file_size / 1024 / 1024:.1f} MB")
-        print(f"Streaming: {filename} | filesize ({file_size / 1024 / 1024:.6f} MB)\n")
+# ═══════════════════════════════════════════════════════════════
+# ── AZURE UPLOAD ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
-        # --- Stream in 256 KB chunks to avoid Azure killing the connection ---
-        SEND_CHUNK = 256 * 1024  # 256 KB per chunk
+def upload_to_azure(parquet_bytes: bytes) -> None:
+    log.info(
+        "Uploading %.2f MB → Azure container=%s  blob=%s",
+        len(parquet_bytes) / 1_048_576,
+        AZURE_CONTAINER_NAME,
+        AZURE_BLOB_NAME,
+    )
+    blob_service      = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STR)
+    container_client  = blob_service.get_container_client(AZURE_CONTAINER_NAME)
 
-        def generate():
-            while True:
-                data = output_buffer.read(SEND_CHUNK)
-                if not data:
-                    break
-                yield data
+    if not container_client.exists():
+        container_client.create_container()
+        log.info("  Container '%s' created.", AZURE_CONTAINER_NAME)
 
-        headers = {
-            "Content-Disposition": f"attachment; filename={filename}",
-            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "Content-Length": str(file_size),   # tells browser exact file size upfront
-            "X-Content-Type-Options": "nosniff"
-        }
+    container_client.get_blob_client(AZURE_BLOB_NAME).upload_blob(
+        io.BytesIO(parquet_bytes), overwrite=True
+    )
+    log.info("Upload complete.")
 
-        return Response(
-            stream_with_context(generate()),
-            headers=headers,
-            status=200
-        )
 
-    except Exception as e:
-        print("\nX Error in /mnrl/data/excel:")
-        print(traceback.format_exc())
-        return {"error": str(e)}, 500
+# ═══════════════════════════════════════════════════════════════
+# ── ORCHESTRATOR ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+
+def run_pipeline() -> None:
+    """
+    End-to-end pipeline:
+      BQ count → batch fetch (5-lakh pages, 3 retries each)
+      → mobile cleanup (ZBTEN3 column)
+      → single Parquet file (all original cols + 4 cleaned cols)
+      → Azure Blob Storage upload
+    """
+    log.info("═" * 60)
+    log.info("Pipeline START")
+    log.info("  Table   : %s", BQ_TABLE)
+    log.info("  Filter  : %s", PARTITION_FILTER)
+    log.info("  Batch   : %d rows", BATCH_SIZE)
+    log.info("  Retries : %d", MAX_RETRIES)
+    log.info("═" * 60)
+
+    client     = _make_bq_client()
+    total_rows = get_total_count(client)
+
+    if total_rows == 0:
+        log.warning("No rows found — nothing to export.")
+        return
+
+    parquet_bytes = batches_to_parquet_bytes(client, total_rows)
+    upload_to_azure(parquet_bytes)
+
+    log.info("═" * 60)
+    log.info("Pipeline COMPLETE")
+    log.info("═" * 60)
+
+
+if __name__ == "__main__":
+    run_pipeline()
