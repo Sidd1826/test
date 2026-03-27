@@ -1,0 +1,598 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  Database, FileSpreadsheet, Download, RefreshCw,
+  CheckCircle, AlertCircle, X, Calendar, Loader2,
+  Cloud, HardDrive, BarChart3, Clock, ChevronRight,
+  Upload, Zap, Shield
+} from "lucide-react";
+
+// ─────────────────────────────────────────────
+// CONFIG — swap BASE URLs here only
+// ─────────────────────────────────────────────
+const BASE_URL =
+  process.env.REACT_APP_ENV === "UAT"
+    ? process.env.REACT_APP_BASE_URL_UAT
+    : process.env.REACT_APP_BASE_URL_DEV;
+
+// ─────────────────────────────────────────────
+// API SERVICE
+// ─────────────────────────────────────────────
+const api = {
+  async post(path, body) {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Request failed: ${res.status}`);
+    }
+    return res;
+  },
+
+  async get(path) {
+    const res = await fetch(`${BASE_URL}${path}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Request failed: ${res.status}`);
+    }
+    return res;
+  },
+
+  // FRI
+  async fetchFRICount(date) {
+    const res = await this.post("/fri/count", { date });
+    const data = await res.json();
+    return data.count;
+  },
+
+  async exportFRI(date) {
+    const res = await this.post("/fri/export-and-save", { date });
+    return res.json(); // returns { success, filename, record_count, blob_url, export_date }
+  },
+
+  // MNRL Normal
+  async fetchMNRLCount(date) {
+    const res = await this.post("/mnrl/count", { date });
+    const data = await res.json();
+    return data.count;
+  },
+
+  async exportMNRL(date, dataType) {
+    const res = await this.post("/mnrl/export-and-save", { date, data_type: dataType });
+    return res.json();
+  },
+
+  // MNRL Reactivated
+  async fetchMNRLCountReactivated(date) {
+    const res = await this.post("/mnrl/count/reactivated", { date });
+    const data = await res.json();
+    return data.count;
+  },
+
+  // Files list from PostgreSQL metadata
+  async listFiles(type) {
+    const res = await this.get(`/files/list?type=${type}`);
+    return res.json(); // [{ id, file_name, export_date, record_count, data_type, created_at, blob_url }]
+  },
+
+  // Signed download URL from Azure Blob
+  async getDownloadUrl(fileId, type) {
+    const res = await this.get(`/files/download-url/${fileId}?type=${type}`);
+    const data = await res.json();
+    return data.url; // pre-signed SAS URL
+  },
+};
+
+// ─────────────────────────────────────────────
+// UTILITIES
+// ─────────────────────────────────────────────
+const fmt = (n) => (n != null ? Number(n).toLocaleString("en-IN") : "—");
+const fmtDate = (d) =>
+  new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+const fmtDateTime = (d) =>
+  new Date(d).toLocaleString("en-IN", {
+    day: "numeric", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+const today = () => new Date().toISOString().split("T")[0];
+
+function triggerBlobDownload(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+}
+
+// ─────────────────────────────────────────────
+// SHARED UI COMPONENTS
+// ─────────────────────────────────────────────
+const Alert = ({ type, message, onClose }) => {
+  const cfg = {
+    success: { bar: "#10b981", bg: "#f0fdf4", text: "#065f46", Icon: CheckCircle },
+    error:   { bar: "#ef4444", bg: "#fef2f2", text: "#7f1d1d", Icon: AlertCircle },
+    warning: { bar: "#f59e0b", bg: "#fffbeb", text: "#78350f", Icon: AlertCircle },
+  }[type] || { bar: "#6b7280", bg: "#f9fafb", text: "#111827", Icon: AlertCircle };
+
+  return (
+    <div style={{ background: cfg.bg, borderLeft: `4px solid ${cfg.bar}` }}
+      className="flex items-start gap-3 px-4 py-3 rounded-lg mt-3 animate-fade-in">
+      <cfg.Icon size={18} style={{ color: cfg.bar, flexShrink: 0, marginTop: 2 }} />
+      <p className="flex-1 text-sm font-medium" style={{ color: cfg.text }}>{message}</p>
+      {onClose && (
+        <button onClick={onClose} style={{ color: cfg.text, opacity: 0.6 }}
+          className="hover:opacity-100 transition-opacity">
+          <X size={16} />
+        </button>
+      )}
+    </div>
+  );
+};
+
+const DatePicker = ({ value, onChange, label }) => (
+  <div className="flex flex-col gap-1.5">
+    <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-500 uppercase tracking-widest">
+      <Calendar size={13} />
+      {label}
+    </label>
+    <input
+      type="date"
+      value={value}
+      max={today()}
+      onChange={(e) => onChange(e.target.value)}
+      className="px-4 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 font-medium text-sm
+        focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all
+        shadow-sm hover:border-slate-300"
+    />
+  </div>
+);
+
+const CountBadge = ({ label, count, color = "blue" }) => {
+  const colors = {
+    blue: { from: "#2563eb", to: "#4f46e5" },
+    teal: { from: "#0d9488", to: "#0891b2" },
+    violet: { from: "#7c3aed", to: "#6d28d9" },
+  }[color];
+
+  return (
+    <div className="rounded-xl p-4 text-white flex flex-col justify-between"
+      style={{ background: `linear-gradient(135deg, ${colors.from}, ${colors.to})` }}>
+      <p className="text-xs font-semibold uppercase tracking-widest opacity-80">{label}</p>
+      <p className="text-3xl font-bold mt-1 tabular-nums">
+        {count === null
+          ? <span className="text-2xl opacity-50">—</span>
+          : fmt(count)}
+      </p>
+      <p className="text-xs opacity-60 mt-1">records</p>
+    </div>
+  );
+};
+
+const ExportBtn = ({ onClick, loading, disabled, label, icon: Icon = Zap }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled || loading}
+    className="w-full flex items-center justify-center gap-2.5 px-5 py-3.5 rounded-xl
+      font-semibold text-sm transition-all duration-200 shadow-md hover:shadow-lg
+      disabled:opacity-50 disabled:cursor-not-allowed"
+    style={{
+      background: disabled || loading
+        ? "#94a3b8"
+        : "linear-gradient(135deg, #2563eb, #4f46e5)",
+      color: "white",
+    }}
+  >
+    {loading
+      ? <><Loader2 size={16} className="animate-spin" /> Processing…</>
+      : <><Icon size={16} /> {label}</>}
+  </button>
+);
+
+// ─────────────────────────────────────────────
+// FILES TABLE
+// ─────────────────────────────────────────────
+const FilesTable = ({ files, loading, onDownload, showDataType = false }) => {
+  if (loading) return (
+    <div className="flex flex-col items-center justify-center py-16 gap-3">
+      <Loader2 size={28} className="animate-spin text-blue-500" />
+      <p className="text-sm text-slate-400">Loading archive…</p>
+    </div>
+  );
+
+  if (!files.length) return (
+    <div className="flex flex-col items-center justify-center py-16 gap-3">
+      <div className="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center">
+        <Cloud size={24} className="text-slate-400" />
+      </div>
+      <p className="text-slate-600 font-medium text-sm">No files in Azure Blob yet</p>
+      <p className="text-slate-400 text-xs">Export data to create the first archive entry</p>
+    </div>
+  );
+
+  const sorted = [...files].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+  return (
+    <div className="overflow-x-auto rounded-xl border border-slate-200">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="bg-slate-50 border-b border-slate-200">
+            {["File Name", "Export Date", showDataType && "Data Type", "Records", "Uploaded At", ""].filter(Boolean).map((h) => (
+              <th key={h} className="px-5 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {sorted.map((file) => (
+            <tr key={file.id} className="hover:bg-blue-50/40 transition-colors group">
+              <td className="px-5 py-3.5">
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet size={15} className="text-green-600 shrink-0" />
+                  <span className="text-slate-700 font-medium truncate max-w-[200px]">{file.file_name}</span>
+                </div>
+              </td>
+              <td className="px-5 py-3.5 text-slate-500 whitespace-nowrap">{fmtDate(file.export_date)}</td>
+              {showDataType && (
+                <td className="px-5 py-3.5">
+                  <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+                    file.data_type === "Reactivated"
+                      ? "bg-violet-100 text-violet-700"
+                      : "bg-teal-100 text-teal-700"
+                  }`}>
+                    {file.data_type === "Reactivated" ? "Reactivated" : "Normal"}
+                  </span>
+                </td>
+              )}
+              <td className="px-5 py-3.5">
+                <span className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-semibold tabular-nums">
+                  {fmt(file.record_count)}
+                </span>
+              </td>
+              <td className="px-5 py-3.5 text-slate-400 text-xs whitespace-nowrap">{fmtDateTime(file.created_at)}</td>
+              <td className="px-5 py-3.5">
+                <button
+                  onClick={() => onDownload(file)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-600
+                    bg-blue-50 hover:bg-blue-600 hover:text-white rounded-lg transition-all"
+                >
+                  <Download size={13} /> Download
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────
+// FRI MODULE
+// ─────────────────────────────────────────────
+const FRIModule = () => {
+  const [date, setDate]           = useState(today());
+  const [count, setCount]         = useState(null);
+  const [files, setFiles]         = useState([]);
+  const [loadingFiles, setLF]     = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [alert, setAlert]         = useState(null); // { type, message }
+
+  const showAlert = (type, message) => {
+    setAlert({ type, message });
+    if (type === "success") setTimeout(() => setAlert(null), 6000);
+  };
+
+  const loadFiles = useCallback(async () => {
+    setLF(true);
+    try {
+      const data = await api.listFiles("FRI");
+      setFiles(data);
+    } catch (e) {
+      showAlert("error", "Failed to load file archive: " + e.message);
+    } finally {
+      setLF(false);
+    }
+  }, []);
+
+  const handleDateChange = async (d) => {
+    setDate(d);
+    setCount(null);
+    try {
+      const n = await api.fetchFRICount(d);
+      setCount(n);
+    } catch (e) {
+      console.warn("Count fetch:", e.message);
+    }
+  };
+
+  const handleExport = async () => {
+    setExporting(true);
+    setAlert(null);
+    try {
+      const n = await api.fetchFRICount(date);
+      setCount(n);
+      if (n === 0) { showAlert("warning", "No records for selected date."); return; }
+
+      // Single backend call: fetches data → builds Excel → uploads to Azure Blob → saves metadata to PostgreSQL
+      const result = await api.exportFRI(date);
+      await loadFiles();
+      showAlert("success", `✓ Exported ${fmt(result.record_count)} records → stored in Azure Blob`);
+    } catch (e) {
+      showAlert("error", e.message || "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleDownload = async (file) => {
+    try {
+      // Backend generates a short-lived SAS URL for direct Azure Blob download
+      const url = await api.getDownloadUrl(file.id, "FRI");
+      triggerBlobDownload(url, file.file_name);
+    } catch (e) {
+      showAlert("error", "Download failed: " + e.message);
+    }
+  };
+
+  useEffect(() => { loadFiles(); }, [loadFiles]);
+  useEffect(() => { handleDateChange(date); }, []); // initial count
+
+  return (
+    <div className="space-y-6">
+      {/* Control Panel */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center">
+            <Database size={18} className="text-white" />
+          </div>
+          <div>
+            <h2 className="text-lg font-bold text-slate-800">FRI Data Export</h2>
+            <p className="text-xs text-slate-400">Exports directly to Azure Blob · Metadata saved to PostgreSQL</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+          <DatePicker value={date} onChange={handleDateChange} label="Select Export Date" />
+          <CountBadge label="FRI Records" count={count} color="blue" />
+          <div className="rounded-xl border border-slate-200 p-4 flex flex-col gap-2 justify-center bg-slate-50">
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium">
+              <Cloud size={14} /> Azure Blob Storage
+            </div>
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium">
+              <HardDrive size={14} /> PostgreSQL Metadata
+            </div>
+            <div className="flex items-center gap-2 text-slate-400 text-xs font-medium">
+              <Shield size={14} /> SAS-Token Downloads
+            </div>
+          </div>
+        </div>
+
+        <ExportBtn
+          onClick={handleExport}
+          loading={exporting}
+          disabled={count === 0}
+          label="Export FRI Data → Azure Blob"
+          icon={Upload}
+        />
+
+        {alert && (
+          <Alert type={alert.type} message={alert.message}
+            onClose={alert.type !== "success" ? () => setAlert(null) : undefined} />
+        )}
+      </div>
+
+      {/* Archive */}
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={18} className="text-blue-600" />
+            <h3 className="font-bold text-slate-800">FRI Archive</h3>
+            <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs font-semibold rounded-full">
+              {files.length} files
+            </span>
+          </div>
+          <button onClick={loadFiles} disabled={loadingFiles}
+            className="flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 font-medium px-3 py-1.5 hover:bg-blue-50 rounded-lg transition-colors">
+            <RefreshCw size={13} className={loadingFiles ? "animate-spin" : ""} /> Refresh
+          </button>
+        </div>
+        <FilesTable files={files} loading={loadingFiles} onDownload={handleDownload} />
+      </div>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────
+// MNRL MODULE
+// ─────────────────────────────────────────────
+const MNRLModule = () => {
+  const [date, setDate]                   = useState(today());
+  const [normalCount, setNormalCount]     = useState(null);
+  const [reactCount, setReactCount]       = useState(null);
+  const [files, setFiles]                 = useState([]);
+  const [loadingFiles, setLF]             = useState(true);
+  const [exportingNormal, setExpN]        = useState(false);
+  const [exportingReact, setExpR]         = useState(false);
+  const [alert, setAlert]                 = useState(null);
+
+  const showAlert = (type, message) => {
+    setAlert({ type, message });
+    if (type === "success") setTimeout(() => setAlert(null), 6000);
+  };
+
+  const loadFiles = useCallback(async () => {
+    setLF(true);
+    try {
+      const data = await api.listFiles("MNRL");
+      setFiles(data);
+    } catch (e) {
+      showAlert("error", "Failed to load file archive: " + e.message);
+    } finally {
+      setLF(false);
+    }
+  }, []);
+
+  const fetchCounts = async (d) => {
+    const [n, r] = await Promise.allSettled([
+      api.fetchMNRLCount(d),
+      api.fetchMNRLCountReactivated(d),
+    ]);
+    setNormalCount(n.status === "fulfilled" ? n.value : null);
+    setReactCount(r.status === "fulfilled" ? r.value : null);
+  };
+
+  const handleDateChange = async (d) => {
+    setDate(d);
+    setNormalCount(null);
+    setReactCount(null);
+    await fetchCounts(d);
+  };
+
+  const handleExportNormal = async () => {
+    setExpN(true);
+    setAlert(null);
+    try {
+      if (normalCount === 0) { showAlert("warning", "No normal records for selected date."); return; }
+      const result = await api.exportMNRL(date, "Normal");
+      await loadFiles();
+      showAlert("success", `✓ Exported ${fmt(result.record_count)} Normal records → Azure Blob`);
+    } catch (e) {
+      showAlert("error", e.message || "Export failed");
+    } finally {
+      setExpN(false);
+    }
+  };
+
+  const handleExportReactivated = async () => {
+    setExpR(true);
+    setAlert(null);
+    try {
+      if (reactCount === 0) { showAlert("warning", "No reactivated records for selected date."); return; }
+      const result = await api.exportMNRL(date, "Reactivated");
+      await loadFiles();
+      showAlert("success", `✓ Exported ${fmt(result.record_count)} Reactivated records → Azure Blob`);
+    } catch (e) {
+      showAlert("error", e.message || "Export failed");
+    } finally {
+      setExpR(false);
+    }
+  };
+
+  const handleDownload = async (file) => {
+    try {
+      const url = await api.getDownloadUrl(file.id, "MNRL");
+      triggerBlobDownload(url, file.file_name);
+    } catch (e) {
+      showAlert("error", "Download failed: " + e.message);
+    }
+  };
+
+  useEffect(() => { loadFiles(); }, [loadFiles]);
+  useEffect(() => { fetchCounts(date); }, []); // initial counts
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div className="flex items-center gap-3 mb-6">
+          <div className="w-10 h-10 rounded-xl bg-teal-600 flex items-center justify-center">
+            <Database size={18} className="text-white" />
+          </div>
+          <div>
+            <h2 className="text-lg font-bold text-slate-800">MNRL Data Export</h2>
+            <p className="text-xs text-slate-400">Normal & Reactivated · Azure Blob · PostgreSQL Metadata</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+          <DatePicker value={date} onChange={handleDateChange} label="Select Export Date" />
+          <CountBadge label="Normal Records" count={normalCount} color="teal" />
+          <CountBadge label="Reactivated Records" count={reactCount} color="violet" />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-2">
+          <ExportBtn
+            onClick={handleExportNormal}
+            loading={exportingNormal}
+            disabled={normalCount === 0 || exportingReact}
+            label="Export Normal → Azure Blob"
+            icon={Upload}
+          />
+          <ExportBtn
+            onClick={handleExportReactivated}
+            loading={exportingReact}
+            disabled={reactCount === 0 || exportingNormal}
+            label="Export Reactivated → Azure Blob"
+            icon={Upload}
+          />
+        </div>
+
+        {alert && (
+          <Alert type={alert.type} message={alert.message}
+            onClose={alert.type !== "success" ? () => setAlert(null) : undefined} />
+        )}
+      </div>
+
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+        <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={18} className="text-teal-600" />
+            <h3 className="font-bold text-slate-800">MNRL Archive</h3>
+            <span className="px-2 py-0.5 bg-teal-100 text-teal-700 text-xs font-semibold rounded-full">
+              {files.length} files
+            </span>
+          </div>
+          <button onClick={loadFiles} disabled={loadingFiles}
+            className="flex items-center gap-1.5 text-xs text-teal-600 hover:text-teal-800 font-medium px-3 py-1.5 hover:bg-teal-50 rounded-lg transition-colors">
+            <RefreshCw size={13} className={loadingFiles ? "animate-spin" : ""} /> Refresh
+          </button>
+        </div>
+        <FilesTable files={files} loading={loadingFiles} onDownload={handleDownload} showDataType />
+      </div>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────
+// HEADER
+// ─────────────────────────────────────────────
+const Header = ({ active, setActive }) => (
+  <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+    <div className="max-w-5xl mx-auto flex items-center justify-between h-16 px-6">
+      <div className="flex items-center gap-3">
+        <img src="/HSBC_MASTERBRAND_LOGO_RGB.png" alt="HSBC" height={44} style={{ height: 44 }} />
+        <div className="h-7 w-px bg-slate-200" />
+        <span className="text-sm font-semibold text-slate-600 tracking-wide">DOT Intelligence Platform</span>
+      </div>
+      <nav className="flex gap-1 bg-slate-100 rounded-xl p-1">
+        {["FRI", "MNRL"].map((m) => (
+          <button key={m} onClick={() => setActive(m)}
+            className={`px-5 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+              active === m
+                ? "bg-white shadow-sm text-blue-700"
+                : "text-slate-500 hover:text-slate-700"
+            }`}>
+            {m}
+          </button>
+        ))}
+      </nav>
+    </div>
+  </header>
+);
+
+// ─────────────────────────────────────────────
+// ROOT
+// ─────────────────────────────────────────────
+export default function HomeScreen() {
+  const [active, setActive] = useState("FRI");
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <Header active={active} setActive={setActive} />
+      <main className="max-w-5xl mx-auto px-6 py-8">
+        {active === "FRI" ? <FRIModule /> : <MNRLModule />}
+      </main>
+    </div>
+  );
+}

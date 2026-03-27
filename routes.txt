@@ -1,0 +1,225 @@
+"""
+routes.py — DOT Intelligence Platform
+Exposes HTTP endpoints only.
+All Azure Blob / PostgreSQL logic is in azure.py.
+"""
+
+import traceback
+from flask import Blueprint, jsonify, request
+
+from azure import (
+    export_and_store,
+    get_sas_download_url,
+    get_export_metadata_row,
+    list_export_metadata,
+)
+
+# Your existing data-fetch + decrypt helpers (unchanged)
+from your_helpers import (
+    fri_count,
+    fetch_and_decrypt_all,
+    mnrl_count,
+    mnrl_data,
+    mnrl_count_reactivated,
+    mnrl_data_reactivated_excel,
+)
+
+routes = Blueprint("routes", __name__)
+
+# Column definitions per module/type (single source of truth)
+FRI_COLUMNS          = ["fri", "lsa_id", "mobile_no", "status", "tsp_id"]
+MNRL_NORMAL_COLUMNS  = ["date_of_disconnection", "disconnectionreason_id", "lsa_id", "mobile_no", "tsp_id"]
+MNRL_REACT_COLUMNS   = ["date_of_reactivation", "mobile_no", "reactivation_id"]
+
+
+# ══════════════════════════════════════════════════════════════
+# FRI
+# ══════════════════════════════════════════════════════════════
+
+@routes.route("/fri/count", methods=["POST"])
+def route_fri_count():
+    req  = request.get_json(silent=True) or {}
+    date = req.get("date")
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+    try:
+        result = fri_count(key_id="FRI", count_date=date)
+        return jsonify({"count": result.get("count", 0)})
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@routes.route("/fri/export-and-save", methods=["POST"])
+def route_fri_export():
+    req  = request.get_json(silent=True) or {}
+    date = req.get("date")
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+
+    try:
+        # 1. Count
+        total = fri_count(key_id="FRI", count_date=date).get("count", 0)
+        if total == 0:
+            return jsonify({"error": "No records found for this date"}), 404
+
+        # 2. Fetch + decrypt
+        records = fetch_and_decrypt_all(
+            key_id="FRI",
+            total_count=total,
+            date=date,
+            client_id=req.get("client_id"),
+            BATCH_SIZE=req.get("batch_size", 3_000),
+        )
+        if not records:
+            return jsonify({"error": "No data retrieved"}), 404
+
+        # 3. Delegate: build Excel → upload Blob → save PostgreSQL metadata
+        file_name = f"fri_data_{date}_{len(records)}_records.xlsx"
+        result = export_and_store(
+            module="FRI",
+            records=records,
+            columns=FRI_COLUMNS,
+            file_name=file_name,
+            export_date=date,
+        )
+        return jsonify({"success": True, **result}), 200
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════
+# MNRL
+# ══════════════════════════════════════════════════════════════
+
+@routes.route("/mnrl/count", methods=["POST"])
+def route_mnrl_count():
+    req  = request.get_json(silent=True) or {}
+    date = req.get("date")
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+    try:
+        result = mnrl_count(key_id="DIU", count_date=date)
+        return jsonify({"count": result.get("count", 0)})
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@routes.route("/mnrl/count/reactivated", methods=["POST"])
+def route_mnrl_count_reactivated():
+    req  = request.get_json(silent=True) or {}
+    date = req.get("date")
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+    try:
+        result = mnrl_count_reactivated(key_id="DIU", count_date=date)
+        return jsonify({"count": result.get("count", 0)})
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@routes.route("/mnrl/export-and-save", methods=["POST"])
+def route_mnrl_export():
+    req       = request.get_json(silent=True) or {}
+    date      = req.get("date")
+    data_type = req.get("data_type", "Normal")
+
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+    if data_type not in ("Normal", "Reactivated"):
+        return jsonify({"error": "data_type must be 'Normal' or 'Reactivated'"}), 400
+
+    try:
+        if data_type == "Normal":
+            total = mnrl_count(key_id="DIU", count_date=date).get("count", 0)
+            if total == 0:
+                return jsonify({"error": "No records found for this date"}), 404
+
+            records = mnrl_data(
+                key_id="DIU",
+                total_count=total,
+                date=date,
+                BATCH_SIZE=req.get("batch_size", 3_000),
+                Bank_Id=req.get("BankId"),
+                max_workers=req.get("max_workers", 5),
+            )
+            columns   = MNRL_NORMAL_COLUMNS
+            file_name = f"mnrl_normal_{date}_{len(records)}_records.xlsx"
+
+        else:  # Reactivated
+            total = mnrl_count_reactivated(key_id="DIU", count_date=date).get("count", 0)
+            if total == 0:
+                return jsonify({"error": "No reactivated records found for this date"}), 404
+
+            records = mnrl_data_reactivated_excel(
+                key_id="DIU",
+                total_count=total,
+                date=date,
+                BATCH_SIZE=req.get("batch_size", 3_000),
+                Bank_Id=req.get("BankId"),
+                max_workers=req.get("max_workers", 5),
+            )
+            columns   = MNRL_REACT_COLUMNS
+            file_name = f"mnrl_reactivated_{date}_{len(records)}_records.xlsx"
+
+        if not records:
+            return jsonify({"error": "No data retrieved"}), 404
+
+        # Delegate: build Excel → upload Blob → save PostgreSQL metadata
+        result = export_and_store(
+            module="MNRL",
+            records=records,
+            columns=columns,
+            file_name=file_name,
+            export_date=date,
+            data_type=data_type,
+        )
+        return jsonify({"success": True, **result}), 200
+
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════
+# FILES  — list + signed download URL
+# ══════════════════════════════════════════════════════════════
+
+@routes.route("/files/list", methods=["GET"])
+def route_files_list():
+    """
+    Return all export metadata rows for a module.
+    GET /files/list?type=FRI
+    """
+    module = request.args.get("type", "FRI").upper()
+    if module not in ("FRI", "MNRL"):
+        return jsonify({"error": "type must be FRI or MNRL"}), 400
+    try:
+        return jsonify(list_export_metadata(module))
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@routes.route("/files/download-url/<file_id>", methods=["GET"])
+def route_files_download_url(file_id):
+    """
+    Return a 1-hour SAS URL for direct Azure Blob download.
+    GET /files/download-url/<uuid>?type=FRI
+    """
+    module = request.args.get("type", "FRI").upper()
+    if module not in ("FRI", "MNRL"):
+        return jsonify({"error": "type must be FRI or MNRL"}), 400
+    try:
+        row = get_export_metadata_row(file_id, module)
+        url = get_sas_download_url(row["container"], row["blob_name"], expiry_hours=1)
+        return jsonify({"url": url, "file_name": row["file_name"]})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500

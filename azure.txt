@@ -1,0 +1,267 @@
+"""
+azure.py — DOT Intelligence Platform
+All Azure Blob Storage + Azure PostgreSQL logic lives here.
+Routes import from this module; nothing Azure-specific leaks into routes.py.
+"""
+
+import io, os, uuid
+from datetime import datetime, timezone, timedelta
+
+import psycopg2
+import psycopg2.extras
+from azure.storage.blob import (
+    BlobServiceClient,
+    BlobSasPermissions,
+    generate_blob_sas,
+)
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG  (pulled from environment / Azure App Settings)
+# ─────────────────────────────────────────────────────────────
+AZURE_STORAGE_CONNECTION_STRING = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+AZURE_STORAGE_ACCOUNT_NAME      = os.environ["AZURE_STORAGE_ACCOUNT_NAME"]
+AZURE_STORAGE_ACCOUNT_KEY       = os.environ["AZURE_STORAGE_ACCOUNT_KEY"]
+AZURE_CONTAINER_FRI             = os.environ.get("AZURE_CONTAINER_FRI",  "fri-exports")
+AZURE_CONTAINER_MNRL            = os.environ.get("AZURE_CONTAINER_MNRL", "mnrl-exports")
+
+PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
+# e.g. "host=xxx.postgres.database.azure.com dbname=dotdb user=admin password=xxx sslmode=require"
+
+
+# ══════════════════════════════════════════════════════════════
+# INTERNAL UTILITIES  (not exported)
+# ══════════════════════════════════════════════════════════════
+
+def _get_container_name(module: str) -> str:
+    return AZURE_CONTAINER_FRI if module.upper() == "FRI" else AZURE_CONTAINER_MNRL
+
+
+def _pg_conn():
+    """Open and return a new psycopg2 connection."""
+    return psycopg2.connect(PG_DSN)
+
+
+# ══════════════════════════════════════════════════════════════
+# EXCEL  — write-only mode, safe for 10-lakh rows
+# ══════════════════════════════════════════════════════════════
+
+def build_excel(records: list, columns: list) -> io.BytesIO:
+    """
+    Build an .xlsx file from records using openpyxl write-only mode.
+    Rows are flushed incrementally — peak RAM stays flat regardless of
+    how many records are passed (tested up to 10-lakh rows).
+
+    Args:
+        records : list of dicts, each keyed by column name
+        columns : ordered list of column keys to include
+
+    Returns:
+        io.BytesIO positioned at 0, ready to read or upload
+    """
+    buf = io.BytesIO()
+    wb  = Workbook(write_only=True)
+    ws  = wb.create_sheet("Data")
+
+    # ── Header row ──
+    header_font  = Font(bold=True, color="FFFFFF")
+    header_fill  = PatternFill("solid", fgColor="1D4ED8")
+    header_align = Alignment(horizontal="center")
+
+    header_cells = []
+    for col in columns:
+        cell           = WriteOnlyCell(ws, value=col.replace("_", " ").title())
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+        header_cells.append(cell)
+    ws.append(header_cells)
+
+    # ── Data rows written in 5k-row chunks ──
+    CHUNK = 5_000
+    for start in range(0, len(records), CHUNK):
+        for rec in records[start : start + CHUNK]:
+            ws.append([rec.get(c, "") for c in columns])
+
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ══════════════════════════════════════════════════════════════
+# AZURE BLOB
+# ══════════════════════════════════════════════════════════════
+
+def upload_blob(container: str, blob_name: str, data: bytes) -> str:
+    """
+    Upload raw bytes to Azure Blob Storage.
+
+    Returns the canonical blob URL (no SAS token).
+    """
+    client      = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    blob_client = client.get_blob_client(container=container, blob=blob_name)
+    blob_client.upload_blob(data, overwrite=True)
+    return blob_client.url
+
+
+def get_sas_download_url(container: str, blob_name: str, expiry_hours: int = 1) -> str:
+    """
+    Generate a short-lived read-only SAS URL so the browser can download
+    directly from Azure Blob — no server proxy required.
+
+    Returns a full HTTPS URL with embedded SAS token.
+    """
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT_NAME,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=AZURE_STORAGE_ACCOUNT_KEY,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+    )
+    return (
+        f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+        f"/{container}/{blob_name}?{sas_token}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# POSTGRESQL  — metadata CRUD
+# ══════════════════════════════════════════════════════════════
+
+def save_export_metadata(
+    module: str,
+    file_name: str,
+    blob_name: str,
+    record_count: int,
+    export_date: str,
+    data_type: str = None,
+) -> str:
+    """
+    Persist export metadata to PostgreSQL after a successful Blob upload.
+
+    Returns the UUID string of the newly created row.
+    """
+    row_id    = str(uuid.uuid4())
+    container = _get_container_name(module)
+
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO export_files
+                (id, module, file_name, blob_name, container,
+                 record_count, export_date, data_type, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                row_id, module.upper(), file_name, blob_name, container,
+                record_count, export_date, data_type,
+            ),
+        )
+    return row_id
+
+
+def list_export_metadata(module: str) -> list:
+    """
+    Fetch all export rows for a module from PostgreSQL, newest first.
+
+    Returns a list of plain dicts (JSON-serialisable).
+    """
+    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, file_name, blob_name, container,
+                   record_count, export_date, data_type, created_at
+            FROM   export_files
+            WHERE  module = %s
+            ORDER  BY created_at DESC
+            """,
+            (module.upper(),),
+        )
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["created_at"]  = d["created_at"].isoformat()
+        d["export_date"] = str(d["export_date"])
+        result.append(d)
+    return result
+
+
+def get_export_metadata_row(file_id: str, module: str) -> dict:
+    """
+    Fetch a single metadata row by UUID + module.
+
+    Raises ValueError if not found.
+    """
+    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM export_files WHERE id = %s AND module = %s",
+            (file_id, module.upper()),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise ValueError(f"No export record found: id={file_id}, module={module}")
+    return dict(row)
+
+
+# ══════════════════════════════════════════════════════════════
+# HIGH-LEVEL ORCHESTRATION
+# Called by routes.py — single function does the full
+# build → upload → save-metadata pipeline.
+# ══════════════════════════════════════════════════════════════
+
+def export_and_store(
+    module: str,
+    records: list,
+    columns: list,
+    file_name: str,
+    export_date: str,
+    data_type: str = None,
+) -> dict:
+    """
+    Build Excel → upload to Azure Blob → save metadata to PostgreSQL.
+
+    Args:
+        module      : "FRI" or "MNRL"
+        records     : list of dicts from the decryption layer
+        columns     : ordered column keys for the Excel sheet
+        file_name   : desired filename
+        export_date : ISO date string "YYYY-MM-DD"
+        data_type   : "Normal" | "Reactivated" | None
+
+    Returns:
+        dict with: id, file_name, record_count, export_date, module, data_type
+    """
+    container = _get_container_name(module)
+    blob_name = f"{export_date}/{file_name}"
+
+    # 1. Build Excel (write-only — handles 10-lakh rows safely)
+    buf = build_excel(records, columns)
+
+    # 2. Upload buffer bytes to Azure Blob
+    upload_blob(container, blob_name, buf.read())
+
+    # 3. Persist metadata to PostgreSQL
+    row_id = save_export_metadata(
+        module=module,
+        file_name=file_name,
+        blob_name=blob_name,
+        record_count=len(records),
+        export_date=export_date,
+        data_type=data_type,
+    )
+
+    return {
+        "id":           row_id,
+        "file_name":    file_name,
+        "record_count": len(records),
+        "export_date":  export_date,
+        "module":       module.upper(),
+        "data_type":    data_type,
+    }

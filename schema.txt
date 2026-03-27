@@ -1,0 +1,26 @@
+-- ─────────────────────────────────────────────────────────────
+-- DOT Intelligence Platform — Azure PostgreSQL Schema
+-- Run once to create the metadata table.
+-- ─────────────────────────────────────────────────────────────
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"; -- for gen_random_uuid()
+
+CREATE TABLE IF NOT EXISTS export_files (
+    id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    module        VARCHAR(10)  NOT NULL CHECK (module IN ('FRI', 'MNRL')),
+    file_name     TEXT         NOT NULL,
+    blob_name     TEXT         NOT NULL,          -- path inside the container
+    container     TEXT         NOT NULL,          -- Azure Blob container name
+    record_count  INTEGER      NOT NULL,
+    export_date   DATE         NOT NULL,
+    data_type     VARCHAR(20),                    -- 'Normal' | 'Reactivated' | NULL for FRI
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Fast lookups by module (used by /files/list)
+CREATE INDEX IF NOT EXISTS idx_export_files_module ON export_files (module, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────
+-- Sample query: list MNRL files
+-- SELECT * FROM export_files WHERE module = 'MNRL' ORDER BY created_at DESC;
+-- ─────────────────────────────────────────────────────────────
