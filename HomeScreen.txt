@@ -14,8 +14,37 @@ const BASE_URL =
     ? process.env.REACT_APP_BASE_URL_UAT
     : process.env.REACT_APP_BASE_URL_DEV;
 
-const POLL_INTERVAL_MS = 3000;
 const PAGE_SIZE = 10;
+
+// ─────────────────────────────────────────────
+// RECORD-COUNT-BASED DYNAMIC POLLING CONFIG
+//
+// Instead of a fixed time threshold, the slow-phase duration is
+// derived from the actual record count known before the export starts.
+//
+//   FAST_POLL_MS    — poll interval once in fast phase (3 s)
+//   SLOW_POLL_MS    — poll interval during patient phase (20 s)
+//   MS_PER_RECORD   — rough estimate: server ms per record (tune this)
+//   FAST_THRESHOLD  — counts at or below this skip slow phase entirely
+//
+// Examples with defaults (MS_PER_RECORD = 1.2):
+//    10 000 records →  12 s estimated → FAST from start  (< 30 k)
+//    50 000 records →  60 s estimated → slow 60 s, then fast
+//   1 00 000 records → 120 s estimated → slow 120 s, then fast
+//   5 00 000 records → 600 s estimated → slow 600 s, then fast
+// ─────────────────────────────────────────────
+const POLL = {
+  FAST_POLL_MS:   3_000,
+  SLOW_POLL_MS:  20_000,
+  MS_PER_RECORD:    1.2,   // ← tune to match your server throughput
+  FAST_THRESHOLD: 30_000,  // ← records below this always use fast mode
+};
+
+/** Returns how long (ms) to stay in slow-poll mode for a given count. */
+function slowPhaseDuration(count) {
+  if (!count || count <= POLL.FAST_THRESHOLD) return 0;
+  return Math.round(count * POLL.MS_PER_RECORD);
+}
 
 // ─────────────────────────────────────────────
 // API SERVICE
@@ -60,22 +89,64 @@ const api = {
 };
 
 // ─────────────────────────────────────────────
-// POLLING HOOK
+// DYNAMIC POLLING HOOK — record-count-aware
+//
+// Accepts `recordCount` (known before the job starts) and uses
+// slowPhaseDuration() to decide how long to poll slowly before
+// switching to fast polling.
+//
+//   recordCount ≤ FAST_THRESHOLD  →  poll every 3 s from the start
+//   recordCount > FAST_THRESHOLD  →  poll every 20 s for the estimated
+//                                    processing time, then every 3 s
+//
+// Uses setTimeout (not setInterval) so the interval changes freely
+// between ticks with no stale-closure issues.
 // ─────────────────────────────────────────────
-function useJobPoller({ jobId, onDone, onFailed }) {
-  const timerRef = useRef(null);
+function useJobPoller({ jobId, recordCount = 0, onDone, onFailed }) {
+  const timerRef      = useRef(null);
+  const startedAt     = useRef(null);
+  const isFast        = useRef(false);
+  const slowPhaseMs   = useRef(0);  // computed once when job starts
+
   useEffect(() => {
     if (!jobId) return;
-    const poll = async () => {
+
+    startedAt.current   = Date.now();
+    isFast.current      = false;
+    slowPhaseMs.current = slowPhaseDuration(recordCount);
+
+    // Log the strategy so it's visible in DevTools (no-op in prod)
+    if (slowPhaseMs.current === 0) {
+      console.info(`[Poller] ${recordCount.toLocaleString()} records → fast mode throughout (3 s)`);
+    } else {
+      console.info(
+        `[Poller] ${recordCount.toLocaleString()} records → slow (20 s) for ${Math.round(slowPhaseMs.current / 1000)} s, then fast (3 s)`
+      );
+    }
+
+    const stop = () => { if (timerRef.current) clearTimeout(timerRef.current); };
+
+    const scheduleNext = () => {
+      const elapsed = Date.now() - startedAt.current;
+      const goFast  = slowPhaseMs.current === 0 || elapsed >= slowPhaseMs.current;
+      if (goFast && !isFast.current) {
+        isFast.current = true;
+        console.info("[Poller] → switched to fast mode (3 s) after", Math.round(elapsed / 1000), "s");
+      }
+      timerRef.current = setTimeout(tick, goFast ? POLL.FAST_POLL_MS : POLL.SLOW_POLL_MS);
+    };
+
+    const tick = async () => {
       try {
         const data = await api.pollJobStatus(jobId);
-        if (data.status === "done")   { clearInterval(timerRef.current); onDone(data.result); }
-        else if (data.status === "failed") { clearInterval(timerRef.current); onFailed(data.error || "Export failed"); }
-      } catch (e) { clearInterval(timerRef.current); onFailed(e.message); }
+        if      (data.status === "done")   { stop(); onDone(data.result); }
+        else if (data.status === "failed") { stop(); onFailed(data.error || "Export failed"); }
+        else                               { scheduleNext(); }
+      } catch (e) { stop(); onFailed(e.message); }
     };
-    timerRef.current = setInterval(poll, POLL_INTERVAL_MS);
-    poll();
-    return () => clearInterval(timerRef.current);
+
+    tick(); // immediate first check — catches tiny jobs instantly
+    return stop;
   }, [jobId]); // eslint-disable-line
 }
 
@@ -542,13 +613,14 @@ const HistoryTable = ({ runs, loading, onDownload }) => {
 // FRI MODULE
 // ─────────────────────────────────────────────
 const FRIModule = () => {
-  const [date, setDate]         = useState(today());
-  const [count, setCount]       = useState(null);
-  const [files, setFiles]       = useState([]);
-  const [loadingFiles, setLF]   = useState(true);
-  const [starting, setStarting] = useState(false);
-  const [jobId, setJobId]       = useState(null);
-  const [alert, setAlert]       = useState(null);
+  const [date, setDate]             = useState(today());
+  const [count, setCount]           = useState(null);
+  const [recordCount, setRecordCount] = useState(0); // used by poller
+  const [files, setFiles]           = useState([]);
+  const [loadingFiles, setLF]       = useState(true);
+  const [starting, setStarting]     = useState(false);
+  const [jobId, setJobId]           = useState(null);
+  const [alert, setAlert]           = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
@@ -574,6 +646,7 @@ const FRIModule = () => {
       const r = await api.fetchFRICount(date);
       setCount(r.count);
       if (r.count === 0) { showAlert("warning", "No records for selected date."); return; }
+      setRecordCount(r.count);           // ← tell poller how many records
       const job = await api.startFRIExport(date);
       setJobId(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -582,6 +655,7 @@ const FRIModule = () => {
 
   useJobPoller({
     jobId,
+    recordCount,                         // ← drives slow/fast phase duration
     onDone: async (result) => {
       setJobId(null); await loadFiles();
       showAlert("success", `✓ Exported ${fmt(result.record_count)} records → saved to Azure Blob`);
@@ -653,16 +727,18 @@ const FRIModule = () => {
 // MNRL MODULE
 // ─────────────────────────────────────────────
 const MNRLModule = () => {
-  const [date, setDate]           = useState(today());
-  const [normalCount, setNC]      = useState(null);
-  const [reactCount, setRC]       = useState(null);
-  const [files, setFiles]         = useState([]);
-  const [loadingFiles, setLF]     = useState(true);
-  const [startingNormal, setSN]   = useState(false);
-  const [startingReact, setSR]    = useState(false);
-  const [jobNormal, setJobNormal] = useState(null);
-  const [jobReact, setJobReact]   = useState(null);
-  const [alert, setAlert]         = useState(null);
+  const [date, setDate]               = useState(today());
+  const [normalCount, setNC]          = useState(null);
+  const [reactCount, setRC]           = useState(null);
+  const [rcNormal, setRcNormal]       = useState(0); // poller record counts
+  const [rcReact, setRcReact]         = useState(0);
+  const [files, setFiles]             = useState([]);
+  const [loadingFiles, setLF]         = useState(true);
+  const [startingNormal, setSN]       = useState(false);
+  const [startingReact, setSR]        = useState(false);
+  const [jobNormal, setJobNormal]     = useState(null);
+  const [jobReact, setJobReact]       = useState(null);
+  const [alert, setAlert]             = useState(null);
 
   const showAlert = (type, message) => {
     setAlert({ type, message });
@@ -694,6 +770,7 @@ const MNRLModule = () => {
     setSN(true); setAlert(null);
     try {
       if (normalCount === 0) { showAlert("warning", "No normal records for selected date."); return; }
+      setRcNormal(normalCount ?? 0);     // ← tell poller
       const job = await api.startMNRLExport(date, "Normal");
       setJobNormal(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -704,6 +781,7 @@ const MNRLModule = () => {
     setSR(true); setAlert(null);
     try {
       if (reactCount === 0) { showAlert("warning", "No reactivated records for selected date."); return; }
+      setRcReact(reactCount ?? 0);       // ← tell poller
       const job = await api.startMNRLExport(date, "Reactivated");
       setJobReact(job.job_id);
     } catch (e) { showAlert("error", e.message); }
@@ -712,6 +790,7 @@ const MNRLModule = () => {
 
   useJobPoller({
     jobId: jobNormal,
+    recordCount: rcNormal,               // ← drives slow/fast phase
     onDone: async (result) => {
       setJobNormal(null); await loadFiles();
       showAlert("success", `✓ Exported ${fmt(result.record_count)} Normal records → Azure Blob`);
@@ -721,6 +800,7 @@ const MNRLModule = () => {
 
   useJobPoller({
     jobId: jobReact,
+    recordCount: rcReact,                // ← drives slow/fast phase
     onDone: async (result) => {
       setJobReact(null); await loadFiles();
       showAlert("success", `✓ Exported ${fmt(result.record_count)} Reactivated records → Azure Blob`);
@@ -879,6 +959,7 @@ const MatchoffModule = () => {
 
   useJobPoller({
     jobId,
+    recordCount: 0, // Matchoff row count is unknown until server reads Excel → always fast
     onDone: async (result) => {
       setJobId(null); setLastResult(result); await loadHistory();
       showAlert("success", `Match-off complete — ${fmt(result.matched_count)} of ${fmt(result.input_row_count)} rows matched.`);
