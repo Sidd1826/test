@@ -1,217 +1,161 @@
 """
-routes.py — DOT Intelligence Platform
-Exposes HTTP endpoints only.
-All Azure Blob / PostgreSQL logic  →  azure.py
-All background job tracking        →  jobs.py
+routes.py — PHASE 3 ADDITIONS
+──────────────────────────────
+Paste these imports + routes into your existing routes.py.
 
-499 fix: export endpoints return a job_id immediately.
-The heavy work runs in a background thread.
-Frontend polls /export/status/<job_id> until status == "done".
+New endpoints:
+  GET  /matchoff/folders?container=mnrl-exports   → date folders in that container
+  GET  /matchoff/files?container=x&date=y         → xlsx files in that folder
+  POST /matchoff/start                            → kick off background job (returns job_id)
+  GET  /export/status/<job_id>                    → ALREADY EXISTS, no change needed
+  GET  /matchoff/history                          → all past runs from PostgreSQL
+  GET  /matchoff/download-url/<run_id>            → 24h SAS URL for a past output
 """
 
-import traceback
-from flask import Blueprint, jsonify, request
-
+# ── ADD TO YOUR EXISTING IMPORTS IN routes.py ──
 from azure import (
-    export_and_store,
+    # ... keep all your existing imports ...
+    run_matchoff,
+    list_source_date_folders,
+    list_source_files,
+    list_matchoff_metadata,
+    get_matchoff_run,
     get_sas_download_url,
-    get_export_metadata_row,
-    list_export_metadata,
-)
-from jobs import start_job, get_job
-
-# Your existing data-fetch + decrypt helpers (unchanged)
-from your_helpers import (
-    fri_count,
-    fetch_and_decrypt_all,
-    mnrl_count,
-    mnrl_data,
-    mnrl_count_reactivated,
-    mnrl_data_reactivated_excel,
+    AZURE_CONTAINER_MATCHOFF_OUTPUT,
 )
 
-routes = Blueprint("routes", __name__)
-
-# Column definitions — single source of truth
-FRI_COLUMNS         = ["fri", "lsa_id", "mobile_no", "status", "tsp_id"]
-MNRL_NORMAL_COLUMNS = ["date_of_disconnection", "disconnectionreason_id", "lsa_id", "mobile_no", "tsp_id"]
-MNRL_REACT_COLUMNS  = ["date_of_reactivation", "mobile_no", "reactivation_id"]
+# ── VALID CONTAINERS (matches VALID_SOURCE_CONTAINERS in azure.py) ──
+_VALID = {"fri-exports", "mnrl-exports"}
 
 
 # ══════════════════════════════════════════════════════════════
-# BACKGROUND WORKER FUNCTIONS
-# These run inside the thread pool (jobs.py).
-# They must be plain functions — no Flask context.
+# BACKGROUND WORKER
 # ══════════════════════════════════════════════════════════════
 
-def _do_fri_export(date: str, client_id, batch_size: int) -> dict:
-    total = fri_count(key_id="FRI", count_date=date).get("count", 0)
-    if total == 0:
-        raise ValueError("No records found for this date")
-
-    records = fetch_and_decrypt_all(
-        key_id="FRI",
-        total_count=total,
-        date=date,
-        client_id=client_id,
-        BATCH_SIZE=batch_size,
-    )
-    if not records:
-        raise ValueError("No data retrieved")
-
-    return export_and_store(
-        module="FRI",
-        records=records,
-        columns=FRI_COLUMNS,
-        file_name=f"fri_data_{date}_{len(records)}_records.xlsx",
-        export_date=date,
-    )
-
-
-def _do_mnrl_export(date: str, data_type: str, bank_id, batch_size: int, max_workers: int) -> dict:
-    if data_type == "Normal":
-        total = mnrl_count(key_id="DIU", count_date=date).get("count", 0)
-        if total == 0:
-            raise ValueError("No records found for this date")
-
-        records = mnrl_data(
-            key_id="DIU",
-            total_count=total,
-            date=date,
-            BATCH_SIZE=batch_size,
-            Bank_Id=bank_id,
-            max_workers=max_workers,
-        )
-        columns   = MNRL_NORMAL_COLUMNS
-        file_name = f"mnrl_normal_{date}_{len(records)}_records.xlsx"
-
-    else:  # Reactivated
-        total = mnrl_count_reactivated(key_id="DIU", count_date=date).get("count", 0)
-        if total == 0:
-            raise ValueError("No reactivated records found for this date")
-
-        records = mnrl_data_reactivated_excel(
-            key_id="DIU",
-            total_count=total,
-            date=date,
-            BATCH_SIZE=batch_size,
-            Bank_Id=bank_id,
-            max_workers=max_workers,
-        )
-        columns   = MNRL_REACT_COLUMNS
-        file_name = f"mnrl_reactivated_{date}_{len(records)}_records.xlsx"
-
-    if not records:
-        raise ValueError("No data retrieved")
-
-    return export_and_store(
-        module="MNRL",
-        records=records,
-        columns=columns,
+def _do_matchoff(
+    source_container: str,
+    date_folder: str,
+    file_name: str,
+    mob_col: str,
+) -> dict:
+    """Thin wrapper — all logic lives in azure.py."""
+    return run_matchoff(
+        source_container=source_container,
+        date_folder=date_folder,
         file_name=file_name,
-        export_date=date,
-        data_type=data_type,
+        mob_col=mob_col,
     )
 
 
 # ══════════════════════════════════════════════════════════════
-# FRI ROUTES
+# CASCADE DROPDOWN ENDPOINTS
+# Frontend calls these in sequence to populate its 3 dropdowns:
+#   1. Container    (hardcoded in UI: fri-exports / mnrl-exports)
+#   2. Date folder  → GET /matchoff/folders?container=mnrl-exports
+#   3. File name    → GET /matchoff/files?container=mnrl-exports&date=2025-03-10
 # ══════════════════════════════════════════════════════════════
 
-@routes.route("/fri/count", methods=["POST"])
-def route_fri_count():
-    req  = request.get_json(silent=True) or {}
-    date = req.get("date")
-    if not date:
-        return jsonify({"error": "date is required"}), 400
+@routes.route("/matchoff/folders", methods=["GET"])
+def route_matchoff_folders():
+    """
+    GET /matchoff/folders?container=mnrl-exports
+
+    Returns date folders inside the container, newest first.
+    Response: { "folders": ["2025-03-12", "2025-03-11", "2025-03-10"] }
+    """
+    container = request.args.get("container", "").strip()
+    if not container:
+        return jsonify({"error": "container query param is required"}), 400
+    if container not in _VALID:
+        return jsonify({"error": f"container must be one of: {', '.join(_VALID)}"}), 400
     try:
-        result = fri_count(key_id="FRI", count_date=date)
-        return jsonify({"count": result.get("count", 0)})
+        folders = list_source_date_folders(container)
+        return jsonify({"folders": folders})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
-@routes.route("/fri/export-and-save", methods=["POST"])
-def route_fri_export():
+@routes.route("/matchoff/files", methods=["GET"])
+def route_matchoff_files():
     """
-    Starts a background export job and returns job_id immediately.
-    Client polls /export/status/<job_id>.
+    GET /matchoff/files?container=mnrl-exports&date=2025-03-10
+
+    Returns .xlsx files inside  <container>/<date>/.
+    Response:
+      {
+        "files": [
+          "mnrl_normal_2025-03-10_50000_records.xlsx",
+          "mnrl_reactivated_2025-03-10_12000_records.xlsx"
+        ]
+      }
     """
-    req  = request.get_json(silent=True) or {}
-    date = req.get("date")
+    container = request.args.get("container", "").strip()
+    date      = request.args.get("date", "").strip()
+
+    if not container:
+        return jsonify({"error": "container query param is required"}), 400
     if not date:
-        return jsonify({"error": "date is required"}), 400
+        return jsonify({"error": "date query param is required"}), 400
+    if container not in _VALID:
+        return jsonify({"error": f"container must be one of: {', '.join(_VALID)}"}), 400
 
     try:
-        job_id = start_job(
-            _do_fri_export,
-            date,
-            req.get("client_id"),
-            req.get("batch_size", 3_000),
-        )
-        return jsonify({"job_id": job_id, "status": "pending"}), 202
-
+        files = list_source_files(container, date)
+        return jsonify({"files": files})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
 # ══════════════════════════════════════════════════════════════
-# MNRL ROUTES
+# START MATCHOFF JOB
 # ══════════════════════════════════════════════════════════════
 
-@routes.route("/mnrl/count", methods=["POST"])
-def route_mnrl_count():
-    req  = request.get_json(silent=True) or {}
-    date = req.get("date")
-    if not date:
-        return jsonify({"error": "date is required"}), 400
-    try:
-        result = mnrl_count(key_id="DIU", count_date=date)
-        return jsonify({"count": result.get("count", 0)})
-    except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-@routes.route("/mnrl/count/reactivated", methods=["POST"])
-def route_mnrl_count_reactivated():
-    req  = request.get_json(silent=True) or {}
-    date = req.get("date")
-    if not date:
-        return jsonify({"error": "date is required"}), 400
-    try:
-        result = mnrl_count_reactivated(key_id="DIU", count_date=date)
-        return jsonify({"count": result.get("count", 0)})
-    except Exception as e:
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-@routes.route("/mnrl/export-and-save", methods=["POST"])
-def route_mnrl_export():
+@routes.route("/matchoff/start", methods=["POST"])
+def route_matchoff_start():
     """
-    Starts a background export job and returns job_id immediately.
-    Client polls /export/status/<job_id>.
+    POST /matchoff/start
+
+    Kicks off the background matchoff job. Returns job_id immediately (202).
+    Frontend polls the EXISTING  GET /export/status/<job_id>  endpoint.
+
+    Request body:
+        {
+          "container":  "mnrl-exports",              // required
+          "date":       "2025-03-10",                // required
+          "file_name":  "mnrl_normal_..._records.xlsx",  // required
+          "mob_col":    "mob_num"                    // optional, default "mob_num"
+        }
+
+    Response (202):
+        { "job_id": "abc-123", "status": "pending" }
     """
     req       = request.get_json(silent=True) or {}
-    date      = req.get("date")
-    data_type = req.get("data_type", "Normal")
+    container = req.get("container", "").strip()
+    date      = req.get("date", "").strip()
+    file_name = req.get("file_name", "").strip()
+    mob_col   = req.get("mob_col", "mob_num").strip()
 
+    # Validate
+    if not container:
+        return jsonify({"error": "container is required"}), 400
     if not date:
         return jsonify({"error": "date is required"}), 400
-    if data_type not in ("Normal", "Reactivated"):
-        return jsonify({"error": "data_type must be 'Normal' or 'Reactivated'"}), 400
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
+    if container not in _VALID:
+        return jsonify({"error": f"container must be one of: {', '.join(_VALID)}"}), 400
+    if not mob_col:
+        return jsonify({"error": "mob_col cannot be empty"}), 400
 
     try:
         job_id = start_job(
-            _do_mnrl_export,
+            _do_matchoff,
+            container,
             date,
-            data_type,
-            req.get("BankId"),
-            req.get("batch_size", 3_000),
-            req.get("max_workers", 5),
+            file_name,
+            mob_col,
         )
         return jsonify({"job_id": job_id, "status": "pending"}), 202
 
@@ -221,66 +165,41 @@ def route_mnrl_export():
 
 
 # ══════════════════════════════════════════════════════════════
-# JOB STATUS — frontend polls this
+# HISTORY + DOWNLOAD
 # ══════════════════════════════════════════════════════════════
 
-@routes.route("/export/status/<job_id>", methods=["GET"])
-def route_export_status(job_id):
+@routes.route("/matchoff/history", methods=["GET"])
+def route_matchoff_history():
     """
-    GET /export/status/<job_id>
+    GET /matchoff/history
 
-    Response shape:
-      pending/running : { status: "pending" | "running", job_id }
-      done            : { status: "done", job_id, result: { id, file_name, record_count, ... } }
-      failed          : { status: "failed", job_id, error: "..." }
+    All past matchoff runs, newest first.
+    Response: list of run objects — see save_matchoff_metadata for shape.
     """
-    job = get_job(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-
-    response = {"job_id": job_id, "status": job["status"]}
-
-    if job["status"] == "done":
-        response["result"] = job["result"]
-    elif job["status"] == "failed":
-        # Send a clean error message to the frontend, log the full traceback
-        first_line = (job["error"] or "Unknown error").strip().splitlines()[-1]
-        response["error"] = first_line
-        print(f"[JOB FAILED] {job_id}:\n{job['error']}")
-
-    return jsonify(response), 200
-
-
-# ══════════════════════════════════════════════════════════════
-# FILES  — list + signed download URL
-# ══════════════════════════════════════════════════════════════
-
-@routes.route("/files/list", methods=["GET"])
-def route_files_list():
-    """GET /files/list?type=FRI"""
-    module = request.args.get("type", "FRI").upper()
-    if module not in ("FRI", "MNRL"):
-        return jsonify({"error": "type must be FRI or MNRL"}), 400
     try:
-        return jsonify(list_export_metadata(module))
+        return jsonify(list_matchoff_metadata())
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
-@routes.route("/files/download-url/<file_id>", methods=["GET"])
-def route_files_download_url(file_id):
+@routes.route("/matchoff/download-url/<run_id>", methods=["GET"])
+def route_matchoff_download_url(run_id):
     """
-    GET /files/download-url/<uuid>?type=FRI
-    Returns a 1-hour SAS URL for direct Azure Blob download.
+    GET /matchoff/download-url/<uuid>
+
+    24-hour SAS URL for a past matchoff output file.
+    Response: { "url": "https://...?sig=...", "file_name": "..._matched_1234_records.xlsx" }
     """
-    module = request.args.get("type", "FRI").upper()
-    if module not in ("FRI", "MNRL"):
-        return jsonify({"error": "type must be FRI or MNRL"}), 400
     try:
-        row = get_export_metadata_row(file_id, module)
-        url = get_sas_download_url(row["container"], row["blob_name"], expiry_hours=1)
-        return jsonify({"url": url, "file_name": row["file_name"]})
+        run       = get_matchoff_run(run_id)
+        url       = get_sas_download_url(
+            run["output_container"],
+            run["output_blob_path"],
+            expiry_hours=24,
+        )
+        file_name = run["output_blob_path"].rsplit("/", 1)[-1]
+        return jsonify({"url": url, "file_name": file_name})
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
