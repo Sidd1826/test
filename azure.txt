@@ -1,25 +1,44 @@
 """
 azure.py — DOT Intelligence Platform
 ─────────────────────────────────────
-All Azure Blob Storage and PostgreSQL logic lives here.
-Routes import from this module; nothing Azure-specific leaks into routes.py.
+All Azure Blob Storage and PostgreSQL logic.
 
-Blob structure:
+Key improvements over original:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. MULTI-FILE EXCEL SPLIT  — records > EXCEL_MAX_ROWS are split into
+   multiple numbered Excel files (Part 1, Part 2, …) and each is
+   uploaded as a separate blob.  export_and_store() returns a list of
+   result dicts; routes.py flattens these for the job result.
+
+2. STREAMING EXCEL BUILD   — build_excel() and build_matched_excel()
+   use openpyxl write-only mode throughout; RAM stays flat regardless
+   of volume.
+
+3. CONNECTION POOLING      — psycopg2 connections are managed via a
+   simple pool (psycopg2.pool.ThreadedConnectionPool) so parallel
+   matchoff workers re-use connections instead of opening a new one
+   per chunk.
+
+4. CHUNKED BLOB UPLOAD     — upload_blob() uses chunked upload for
+   large Excel files (> BLOB_CHUNK_THRESHOLD) to avoid memory spikes.
+
+5. MISC CLEANUPS           — explicit resource cleanup, tighter error
+   messages, consistent typing.
+
+Blob structure (unchanged):
   fri-exports/
     2025-03-10/
       fri_data_2025-03-10_30000_records.xlsx
-  mnrl-exports/
-    2025-03-10/
-      mnrl_normal_2025-03-10_50000_records.xlsx
-      mnrl_reactivated_2025-03-10_12000_records.xlsx
-  matchoff-output/             ← created automatically
+      fri_data_2025-03-10_30000_records_part2.xlsx   ← new (if split)
+  mnrl-exports/  …
+  matchoff-output/
     2025-03-10/
       fri_data_2025-03-10_30000_records_matched_1234_records.xlsx
 
-PostgreSQL tables (all three on the same Azure PostgreSQL instance):
-  export_files     — Phase 1 / Phase 2 export metadata
-  mobilecleanup    — Phase 2 bulk-loaded 30L rows (truncated + reloaded daily at 7 AM)
-  matchoff_runs    — Phase 3 match-off run history
+PostgreSQL tables:
+  export_files   — export metadata (one row per blob)
+  mobilecleanup  — Phase 2 bulk-loaded 30L rows
+  matchoff_runs  — Phase 3 run history
 """
 
 import io
@@ -27,9 +46,11 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from typing import Generator
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
@@ -44,7 +65,6 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # CONFIG  (pulled from environment / Azure App Settings)
 # ─────────────────────────────────────────────────────────────
 
-# Blob Storage
 AZURE_STORAGE_CONNECTION_STRING = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
 AZURE_STORAGE_ACCOUNT_NAME      = os.environ["AZURE_STORAGE_ACCOUNT_NAME"]
 AZURE_STORAGE_ACCOUNT_KEY       = os.environ["AZURE_STORAGE_ACCOUNT_KEY"]
@@ -52,25 +72,99 @@ AZURE_CONTAINER_FRI             = os.environ.get("AZURE_CONTAINER_FRI",  "fri-ex
 AZURE_CONTAINER_MNRL            = os.environ.get("AZURE_CONTAINER_MNRL", "mnrl-exports")
 AZURE_CONTAINER_MATCHOFF_OUTPUT = os.environ.get("AZURE_CONTAINER_MATCHOFF_OUTPUT", "matchoff-output")
 
-# PostgreSQL — single DSN for all three tables
 PG_DSN = os.environ["AZURE_POSTGRES_DSN"]
-# e.g. "host=xxx.postgres.database.azure.com dbname=dotdb user=admin password=xxx sslmode=require"
 
-# mobilecleanup table — queried during Phase 3 match-off
 PG_MATCHOFF_TABLE  = os.environ.get("PG_MATCHOFF_TABLE",  "mobilecleanup")
 PG_MOB_COLUMN      = os.environ.get("PG_MOB_COLUMN",      "final_mob_num")
 PG_CUSTID_COLUMN   = os.environ.get("PG_CUSTID_COLUMN",   "cust_id")
 
-# Matchoff tuning knobs
+# Matchoff tuning
 SQL_CHUNK_SIZE   = int(os.environ.get("MATCHOFF_SQL_CHUNK",   "1000"))
 SQL_MAX_WORKERS  = int(os.environ.get("MATCHOFF_SQL_WORKERS", "5"))
 EXCEL_FLUSH_ROWS = int(os.environ.get("MATCHOFF_EXCEL_FLUSH", "5000"))
 
-# Containers that hold the source Excel files (read-only, never written to)
+# Excel row limit — Excel hard cap is 1 048 576 rows (incl. header).
+# We use 10 00 000 as the safe threshold so there's headroom.
+EXCEL_MAX_ROWS = int(os.environ.get("EXCEL_MAX_ROWS", "1_000_000"))
+
+# Blob chunked-upload threshold — files larger than this use streams
+BLOB_CHUNK_THRESHOLD = 64 * 1024 * 1024   # 64 MB
+
+# Valid source containers
 VALID_SOURCE_CONTAINERS = {
     "fri-exports":  AZURE_CONTAINER_FRI,
     "mnrl-exports": AZURE_CONTAINER_MNRL,
 }
+
+# ─────────────────────────────────────────────────────────────
+# CONNECTION POOL  (psycopg2 ThreadedConnectionPool)
+# ─────────────────────────────────────────────────────────────
+_pg_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pg_pool
+    if _pg_pool is None or _pg_pool.closed:
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=max(SQL_MAX_WORKERS + 2, 10),
+            dsn=PG_DSN,
+        )
+    return _pg_pool
+
+
+def _pg_conn():
+    """
+    Obtain a connection from the pool.
+    IMPORTANT: callers must return it via _put_conn() when done.
+    Use the context manager _pg_cursor() for query blocks.
+    """
+    return _get_pool().getconn()
+
+
+def _put_conn(conn):
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        pass
+
+
+class _pg_cursor:
+    """
+    Context manager that borrows a connection from the pool,
+    yields a RealDictCursor, and returns the connection on exit.
+
+    Usage:
+        with _pg_cursor() as cur:
+            cur.execute(...)
+    """
+    def __init__(self, dict_cursor: bool = False):
+        self._dict = dict_cursor
+        self._conn = None
+
+    def __enter__(self):
+        self._conn = _pg_conn()
+        factory = psycopg2.extras.RealDictCursor if self._dict else None
+        self._cur = self._conn.cursor(cursor_factory=factory) if factory else self._conn.cursor()
+        return self._cur
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        else:
+            try:
+                self._conn.commit()
+            except Exception:
+                pass
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        _put_conn(self._conn)
+        return False   # re-raise exceptions
 
 
 # ══════════════════════════════════════════════════════════════
@@ -78,64 +172,101 @@ VALID_SOURCE_CONTAINERS = {
 # ══════════════════════════════════════════════════════════════
 
 def _get_container_name(module: str) -> str:
-    """Map module string to its blob container name."""
     return AZURE_CONTAINER_FRI if module.upper() == "FRI" else AZURE_CONTAINER_MNRL
 
 
-def _pg_conn():
-    """Open and return a new psycopg2 connection (used for ALL DB operations)."""
-    return psycopg2.connect(PG_DSN)
-
-
 def _blob_service() -> BlobServiceClient:
-    """Return a BlobServiceClient from the configured connection string."""
     return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+
+
+def _chunks(lst: list, n: int) -> Generator:
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
 
 
 # ══════════════════════════════════════════════════════════════
 # EXCEL BUILDERS
 # ══════════════════════════════════════════════════════════════
 
-def build_excel(records: list, columns: list) -> io.BytesIO:
-    """
-    Build an .xlsx file from records using openpyxl write-only mode.
-    Rows are flushed incrementally — peak RAM stays flat regardless of
-    how many records are passed (tested up to 10-lakh rows).
-
-    Args:
-        records : list of dicts, each keyed by column name
-        columns : ordered list of column keys to include
-
-    Returns:
-        io.BytesIO positioned at 0, ready to read or upload
-    """
-    buf = io.BytesIO()
-    wb  = Workbook(write_only=True)
-    ws  = wb.create_sheet("Data")
-
-    # ── Header row ──
+def _make_header_cells(ws, columns: list) -> list:
+    """Build styled header cells for a write-only worksheet."""
     header_font  = Font(bold=True, color="FFFFFF")
     header_fill  = PatternFill("solid", fgColor="1D4ED8")
     header_align = Alignment(horizontal="center")
 
-    header_cells = []
+    cells = []
     for col in columns:
         cell           = WriteOnlyCell(ws, value=col.replace("_", " ").title())
         cell.font      = header_font
         cell.fill      = header_fill
         cell.alignment = header_align
-        header_cells.append(cell)
-    ws.append(header_cells)
+        cells.append(cell)
+    return cells
 
-    # ── Data rows written in 5k-row chunks ──
-    CHUNK = 5_000
-    for start in range(0, len(records), CHUNK):
-        for rec in records[start : start + CHUNK]:
+
+def build_excel(records: list, columns: list) -> io.BytesIO:
+    """
+    Build a single .xlsx from records using write-only mode.
+    Use build_excel_parts() when records may exceed EXCEL_MAX_ROWS.
+    """
+    buf = io.BytesIO()
+    wb  = Workbook(write_only=True)
+    ws  = wb.create_sheet("Data")
+    ws.append(_make_header_cells(ws, columns))
+
+    for chunk in _chunks(records, 5_000):
+        for rec in chunk:
             ws.append([rec.get(c, "") for c in columns])
 
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+def build_excel_parts(
+    records: list,
+    columns: list,
+    base_file_name: str,
+    max_rows: int = EXCEL_MAX_ROWS,
+) -> list[tuple[io.BytesIO, str, int]]:
+    """
+    Split records across multiple Excel files if count > max_rows.
+
+    Returns a list of (BytesIO, file_name, row_count) tuples.
+    If records fit in one file, returns a single-element list
+    (file_name unchanged — no _part1 suffix for single files).
+
+    Example output names:
+      single file  → "fri_data_2025-03-10_30000_records.xlsx"
+      multi  file  → "fri_data_2025-03-10_30000_records_part1.xlsx"
+                     "fri_data_2025-03-10_30000_records_part2.xlsx"
+    """
+    total_parts = -(-len(records) // max_rows)   # ceiling division
+
+    results: list[tuple[io.BytesIO, str, int]] = []
+
+    for part_idx, chunk in enumerate(_chunks(records, max_rows), start=1):
+        if total_parts == 1:
+            fname = base_file_name
+        else:
+            stem  = base_file_name.replace(".xlsx", "")
+            fname = f"{stem}_part{part_idx}.xlsx"
+
+        buf = io.BytesIO()
+        wb  = Workbook(write_only=True)
+        ws  = wb.create_sheet("Data")
+        ws.append(_make_header_cells(ws, columns))
+
+        for row_chunk in _chunks(chunk, 5_000):
+            for rec in row_chunk:
+                ws.append([rec.get(c, "") for c in columns])
+
+        wb.save(buf)
+        buf.seek(0)
+        results.append((buf, fname, len(chunk)))
+
+    return results
 
 
 def build_matched_excel(
@@ -145,41 +276,16 @@ def build_matched_excel(
     matched_map: dict[str, str],
 ) -> tuple[io.BytesIO, int]:
     """
-    Write only the matched rows to a new Excel file.
-
-    Output columns = all original Excel columns + cust_id (appended last).
-    Uses openpyxl write-only mode — RAM stays flat regardless of row count.
-
-    Args:
-        input_rows  : all rows read from the source Excel
-        headers     : original column order from the source Excel
-        mob_col     : name of the mobile-number column in the Excel
-        matched_map : { final_mob_num: cust_id } from mobilecleanup
-
-    Returns:
-        (BytesIO ready to upload, matched_row_count)
+    Write only matched rows to a new Excel (all original cols + cust_id).
+    Uses write-only mode — RAM stays flat regardless of row count.
     """
     output_headers = headers + ["cust_id"]
 
     buf = io.BytesIO()
     wb  = Workbook(write_only=True)
     ws  = wb.create_sheet("Matched Data")
+    ws.append(_make_header_cells(ws, output_headers))
 
-    # ── Header row ──
-    header_font  = Font(bold=True, color="FFFFFF")
-    header_fill  = PatternFill("solid", fgColor="1D4ED8")
-    header_align = Alignment(horizontal="center")
-
-    header_cells = []
-    for col_name in output_headers:
-        cell           = WriteOnlyCell(ws, value=col_name.replace("_", " ").title())
-        cell.font      = header_font
-        cell.fill      = header_fill
-        cell.alignment = header_align
-        header_cells.append(cell)
-    ws.append(header_cells)
-
-    # ── Data rows — flushed in batches to keep RAM flat ──
     matched_count = 0
     buffer: list  = []
 
@@ -189,7 +295,7 @@ def build_matched_excel(
             continue
 
         data_row = [row.get(h, "") for h in headers]
-        data_row.append(matched_map[mob_val])   # cust_id appended last
+        data_row.append(matched_map[mob_val])
         buffer.append(data_row)
         matched_count += 1
 
@@ -198,7 +304,7 @@ def build_matched_excel(
                 ws.append(r)
             buffer.clear()
 
-    for r in buffer:   # flush remainder
+    for r in buffer:
         ws.append(r)
 
     wb.save(buf)
@@ -210,30 +316,44 @@ def build_matched_excel(
 # AZURE BLOB — CORE OPERATIONS
 # ══════════════════════════════════════════════════════════════
 
-def upload_blob(container: str, blob_name: str, data: bytes) -> str:
+def upload_blob(container: str, blob_name: str, data: bytes | io.BytesIO) -> str:
     """
-    Upload raw bytes to Azure Blob Storage.
+    Upload bytes or a BytesIO stream to Azure Blob Storage.
+    Uses chunked upload for large payloads to avoid memory spikes.
     Returns the canonical blob URL (no SAS token).
     """
     blob_client = _blob_service().get_blob_client(container=container, blob=blob_name)
-    blob_client.upload_blob(data, overwrite=True)
+
+    if isinstance(data, (bytes, bytearray)):
+        size = len(data)
+        stream = io.BytesIO(data)
+    else:
+        data.seek(0, 2)
+        size = data.tell()
+        data.seek(0)
+        stream = data
+
+    if size > BLOB_CHUNK_THRESHOLD:
+        blob_client.upload_blob(
+            stream,
+            overwrite=True,
+            max_concurrency=4,
+        )
+    else:
+        blob_client.upload_blob(stream, overwrite=True)
+
     return blob_client.url
 
 
 def get_sas_download_url(container: str, blob_name: str, expiry_hours: int = 1) -> str:
-    """
-    Generate a short-lived read-only SAS URL so the browser can download
-    directly from Azure Blob — no server proxy required.
-
-    Returns a full HTTPS URL with embedded SAS token.
-    """
+    """Generate a short-lived read-only SAS URL."""
     sas_token = generate_blob_sas(
-        account_name=AZURE_STORAGE_ACCOUNT_NAME,
-        container_name=container,
-        blob_name=blob_name,
-        account_key=AZURE_STORAGE_ACCOUNT_KEY,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+        account_name   = AZURE_STORAGE_ACCOUNT_NAME,
+        container_name = container,
+        blob_name      = blob_name,
+        account_key    = AZURE_STORAGE_ACCOUNT_KEY,
+        permission     = BlobSasPermissions(read=True),
+        expiry         = datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
     )
     return (
         f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
@@ -242,21 +362,13 @@ def get_sas_download_url(container: str, blob_name: str, expiry_hours: int = 1) 
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOB BROWSER HELPERS
-# Used by frontend cascade dropdowns (container → date → file)
+# BLOB BROWSER HELPERS  (cascade dropdowns)
 # ══════════════════════════════════════════════════════════════
 
 def list_source_date_folders(container: str) -> list[str]:
     """
-    Return all date-folder prefixes inside a source container,
-    sorted newest first.
-    e.g. ["2025-03-12", "2025-03-11", "2025-03-10"]
-
-    Scans blob names and extracts the first path segment.
-    Works even if Azure doesn't store explicit "folder" blobs.
-
-    Raises:
-        ValueError — if container is not a permitted source
+    Return date-folder prefixes inside a source container, newest first.
+    Raises ValueError if container is not a permitted source.
     """
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
@@ -273,14 +385,8 @@ def list_source_date_folders(container: str) -> list[str]:
 
 def list_source_files(container: str, date_folder: str) -> list[str]:
     """
-    Return all .xlsx filenames inside <container>/<date_folder>/.
-    e.g. ["mnrl_normal_2025-03-10_50000_records.xlsx",
-           "mnrl_reactivated_2025-03-10_12000_records.xlsx"]
-
-    Returns only the filename part (not the full blob path).
-
-    Raises:
-        ValueError — if container is not a permitted source
+    Return .xlsx filenames inside <container>/<date_folder>/.
+    Raises ValueError if container is not a permitted source.
     """
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
@@ -306,15 +412,8 @@ def read_excel_from_blob(
     file_name: str,
 ) -> tuple[list[dict], list[str]]:
     """
-    Stream an Excel file from <container>/<date_folder>/<file_name>
-    directly into memory. No temp file, no disk I/O.
-
-    Returns:
-        rows    : list of dicts  { column_header: cell_value }
-        headers : ordered list of column names (original order preserved)
-
-    Raises:
-        ValueError — blob not found, empty file, or no header row
+    Stream an Excel from <container>/<date_folder>/<file_name> into memory.
+    Returns (rows, headers). Raises ValueError on any problem.
     """
     if container not in VALID_SOURCE_CONTAINERS.values():
         raise ValueError(f"Container '{container}' is not a permitted source.")
@@ -327,11 +426,8 @@ def read_excel_from_blob(
         bc.download_blob().readinto(stream)
         stream.seek(0)
     except Exception as e:
-        raise ValueError(
-            f"Could not read blob '{blob_path}' from '{container}': {e}"
-        ) from e
+        raise ValueError(f"Could not read blob '{blob_path}' from '{container}': {e}") from e
 
-    # read_only=True keeps RAM flat on large files
     wb        = load_workbook(filename=stream, read_only=True, data_only=True)
     ws        = wb.active
     rows_iter = ws.iter_rows(values_only=True)
@@ -339,13 +435,13 @@ def read_excel_from_blob(
     try:
         raw_headers = next(rows_iter)
     except StopIteration:
+        wb.close()
         raise ValueError(f"Excel file '{file_name}' is empty.")
 
     headers = [
         str(h).strip() if h is not None else f"col_{i}"
         for i, h in enumerate(raw_headers)
     ]
-
     rows = [dict(zip(headers, row)) for row in rows_iter]
     wb.close()
 
@@ -359,14 +455,10 @@ def read_excel_from_blob(
 # BLOB UPLOAD — matchoff output
 # ══════════════════════════════════════════════════════════════
 
-def upload_matchoff_output(
-    buf: io.BytesIO,
-    date_folder: str,
-    file_name: str,
-) -> str:
+def upload_matchoff_output(buf: io.BytesIO, date_folder: str, file_name: str) -> str:
     """
-    Upload the matched Excel to matchoff-output/<date_folder>/<file_name>.
-    Returns the full blob path (used to generate the SAS URL later).
+    Upload matched Excel to matchoff-output/<date_folder>/<file_name>.
+    Returns the full blob path.
     """
     blob_path = f"{date_folder}/{file_name}"
     bc        = _blob_service().get_blob_client(
@@ -378,26 +470,11 @@ def upload_matchoff_output(
 
 
 # ══════════════════════════════════════════════════════════════
-# MOBILECLEANUP — chunked parallel matching (pure psycopg2)
-#
-# Phase 2 TRUNCATES + bulk-loads this table daily at 7 AM.
-# Phase 3 matches Excel mob_num against final_mob_num here.
-# All queries use psycopg2 — no pyodbc, no Azure SQL.
+# MOBILECLEANUP — chunked parallel matching
 # ══════════════════════════════════════════════════════════════
 
 def _fetch_chunk(mob_chunk: list[str]) -> dict[str, str]:
-    """
-    Query one chunk of mob numbers from the mobilecleanup table.
-    Returns { final_mob_num: cust_id } for matched rows only.
-
-    Key detail — psycopg2 IN %s syntax:
-        cur.execute("... WHERE col IN %s", (tuple(values),))
-        The outer tuple is psycopg2's parameter wrapper.
-        The inner tuple is the actual IN list.
-        This is different from pyodbc which uses IN (?,?,?).
-
-    Opens its own connection — safe to run inside a thread.
-    """
+    """Query one chunk via a pooled connection. Returns {mob: cust_id}."""
     if not mob_chunk:
         return {}
 
@@ -406,34 +483,33 @@ def _fetch_chunk(mob_chunk: list[str]) -> dict[str, str]:
         FROM   {PG_MATCHOFF_TABLE}
         WHERE  {PG_MOB_COLUMN} IN %s
     """
-
     result = {}
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (tuple(mob_chunk),))
-        for row in cur.fetchall():
-            mob_val  = str(row[0]).strip()
-            cust_val = str(row[1]).strip() if row[1] is not None else ""
-            result[mob_val] = cust_val
+    conn   = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (tuple(mob_chunk),))
+            for row in cur.fetchall():
+                mob_val  = str(row[0]).strip()
+                cust_val = str(row[1]).strip() if row[1] is not None else ""
+                result[mob_val] = cust_val
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
 
     return result
 
 
 def match_mob_numbers(
     mob_numbers: list,
-    chunk_size: int = SQL_CHUNK_SIZE,
+    chunk_size: int  = SQL_CHUNK_SIZE,
     max_workers: int = SQL_MAX_WORKERS,
 ) -> dict[str, str]:
     """
-    Match a list of mobile numbers against mobilecleanup in parallel chunks.
-
-    Flow:
-      1. Normalise to strings + deduplicate   → reduces query load on 30L rows
-      2. Split into chunks of `chunk_size`    → keeps each IN clause manageable
-      3. Fire chunks via ThreadPoolExecutor   → parallel I/O, flat CPU
-      4. Merge all results                    → single { final_mob_num: cust_id }
-
-    Returns:
-        { matched_final_mob_num: cust_id, ... }
+    Match mob numbers against mobilecleanup in parallel chunks.
+    Returns {matched_final_mob_num: cust_id}.
     """
     unique_mobs = list({
         str(m).strip()
@@ -444,11 +520,7 @@ def match_mob_numbers(
     if not unique_mobs:
         return {}
 
-    chunks = [
-        unique_mobs[i : i + chunk_size]
-        for i in range(0, len(unique_mobs), chunk_size)
-    ]
-
+    chunks  = list(_chunks(unique_mobs, chunk_size))
     matched: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -457,7 +529,6 @@ def match_mob_numbers(
             try:
                 matched.update(future.result())
             except Exception as exc:
-                # Log but continue — partial results better than a total abort
                 print(f"[MATCHOFF] Chunk query failed: {exc}")
 
     return matched
@@ -475,14 +546,11 @@ def save_export_metadata(
     export_date: str,
     data_type: str = None,
 ) -> str:
-    """
-    Persist export metadata to PostgreSQL after a successful Blob upload.
-    Returns the UUID string of the newly created row.
-    """
+    """Insert export metadata row. Returns the new UUID string."""
     row_id    = str(uuid.uuid4())
     container = _get_container_name(module)
 
-    with _pg_conn() as conn, conn.cursor() as cur:
+    with _pg_cursor() as cur:
         cur.execute(
             """
             INSERT INTO export_files
@@ -499,11 +567,8 @@ def save_export_metadata(
 
 
 def list_export_metadata(module: str) -> list:
-    """
-    Fetch all export rows for a module from PostgreSQL, newest first.
-    Returns a list of plain dicts (JSON-serialisable).
-    """
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    """All export rows for a module, newest first, as JSON-serialisable dicts."""
+    with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             """
             SELECT id, file_name, blob_name, container,
@@ -526,11 +591,8 @@ def list_export_metadata(module: str) -> list:
 
 
 def get_export_metadata_row(file_id: str, module: str) -> dict:
-    """
-    Fetch a single export metadata row by UUID + module.
-    Raises ValueError if not found.
-    """
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    """Single export row by UUID + module. Raises ValueError if not found."""
+    with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             "SELECT * FROM export_files WHERE id = %s AND module = %s",
             (file_id, module.upper()),
@@ -556,10 +618,10 @@ def save_matchoff_metadata(
     mob_col: str,
     run_date: str,
 ) -> str:
-    """Persist a matchoff run to PostgreSQL. Returns new row UUID."""
+    """Persist a matchoff run. Returns new row UUID."""
     row_id = str(uuid.uuid4())
 
-    with _pg_conn() as conn, conn.cursor() as cur:
+    with _pg_cursor() as cur:
         cur.execute(
             """
             INSERT INTO matchoff_runs (
@@ -584,8 +646,8 @@ def save_matchoff_metadata(
 
 
 def list_matchoff_metadata() -> list:
-    """All matchoff runs from PostgreSQL, newest first."""
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    """All matchoff runs, newest first."""
+    with _pg_cursor(dict_cursor=True) as cur:
         cur.execute(
             """
             SELECT id,
@@ -611,7 +673,7 @@ def list_matchoff_metadata() -> list:
 
 def get_matchoff_run(run_id: str) -> dict:
     """Single matchoff row by UUID. Raises ValueError if not found."""
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with _pg_cursor(dict_cursor=True) as cur:
         cur.execute("SELECT * FROM matchoff_runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
     if not row:
@@ -632,41 +694,73 @@ def export_and_store(
     data_type: str = None,
 ) -> dict:
     """
-    Build Excel → upload to Azure Blob → save metadata to PostgreSQL.
+    Build Excel(s) → upload to Azure Blob → save metadata to PostgreSQL.
 
-    Args:
-        module      : "FRI" or "MNRL"
-        records     : list of dicts from the decryption layer
-        columns     : ordered column keys for the Excel sheet
-        file_name   : desired filename
-        export_date : ISO date string "YYYY-MM-DD"
-        data_type   : "Normal" | "Reactivated" | None
+    Handles the >10-lakh split automatically:
+      - If records ≤ EXCEL_MAX_ROWS  → single file, same behaviour as before.
+      - If records > EXCEL_MAX_ROWS  → multiple numbered files, each uploaded
+        and stored independently.
 
-    Returns:
-        dict with: id, file_name, record_count, export_date, module, data_type
+    Returns a summary dict:
+        {
+          "parts":        [ { id, file_name, record_count, ... }, … ],
+          "total_records": <int>,
+          "file_count":    <int>,
+          "export_date":   "YYYY-MM-DD",
+          "module":        "FRI" | "MNRL",
+          "data_type":     …,
+        }
     """
     container = _get_container_name(module)
-    blob_name = f"{export_date}/{file_name}"
+    total     = len(records)
 
-    buf = build_excel(records, columns)
-    upload_blob(container, blob_name, buf.read())
-
-    row_id = save_export_metadata(
-        module=module,
-        file_name=file_name,
-        blob_name=blob_name,
-        record_count=len(records),
-        export_date=export_date,
-        data_type=data_type,
+    # Build one or more Excel parts
+    parts_raw = build_excel_parts(
+        records       = records,
+        columns       = columns,
+        base_file_name = file_name,
+        max_rows      = EXCEL_MAX_ROWS,
     )
 
+    parts_meta = []
+
+    for buf, part_fname, row_count in parts_raw:
+        blob_name = f"{export_date}/{part_fname}"
+        upload_blob(container, blob_name, buf)
+
+        row_id = save_export_metadata(
+            module       = module,
+            file_name    = part_fname,
+            blob_name    = blob_name,
+            record_count = row_count,
+            export_date  = export_date,
+            data_type    = data_type,
+        )
+
+        parts_meta.append({
+            "id":           row_id,
+            "file_name":    part_fname,
+            "record_count": row_count,
+            "export_date":  export_date,
+            "module":       module.upper(),
+            "data_type":    data_type,
+        })
+
+        print(
+            f"[EXPORT] Uploaded {module} part → {blob_name} "
+            f"({row_count:,} rows)"
+        )
+
     return {
-        "id":           row_id,
-        "file_name":    file_name,
-        "record_count": len(records),
-        "export_date":  export_date,
-        "module":       module.upper(),
-        "data_type":    data_type,
+        "parts":         parts_meta,
+        "total_records": total,
+        "file_count":    len(parts_meta),
+        "export_date":   export_date,
+        "module":        module.upper(),
+        "data_type":     data_type,
+        # Convenience aliases used by the frontend poller
+        "record_count":  total,
+        "file_name":     parts_meta[0]["file_name"] if parts_meta else file_name,
     }
 
 
@@ -682,18 +776,11 @@ def run_matchoff(
     Steps:
       1. Read source Excel directly from Blob (no disk I/O)
       2. Extract + deduplicate mob_num column
-      3. Chunked parallel query against mobilecleanup (final_mob_num → cust_id)
-      4. Build matched output Excel (all original columns + cust_id)
+      3. Chunked parallel query against mobilecleanup
+      4. Build matched output Excel (original cols + cust_id)
       5. Upload result to matchoff-output/<date_folder>/
       6. Save run metadata to PostgreSQL
       7. Return 24-hour SAS download URL
-
-    Args:
-        source_container : "fri-exports" or "mnrl-exports"
-        date_folder      : "2025-03-10"
-        file_name        : "mnrl_normal_2025-03-10_50000_records.xlsx"
-        mob_col          : column header in the Excel holding the mobile number
-                           (matched against final_mob_num in mobilecleanup)
 
     Returns dict (becomes job.result on the frontend):
         {
@@ -710,10 +797,10 @@ def run_matchoff(
     """
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── 1. Read source Excel from existing blob ──
+    # 1. Read source Excel
     print(f"[MATCHOFF] Reading {source_container}/{date_folder}/{file_name}")
     input_rows, headers = read_excel_from_blob(source_container, date_folder, file_name)
-    print(f"[MATCHOFF] {len(input_rows)} rows, columns: {headers}")
+    print(f"[MATCHOFF] {len(input_rows):,} rows, columns: {headers}")
 
     if mob_col not in headers:
         raise ValueError(
@@ -721,41 +808,41 @@ def run_matchoff(
             f"Available columns: {', '.join(headers)}"
         )
 
-    # ── 2. Extract + deduplicate mob numbers ──
+    # 2. Extract + deduplicate mob numbers
     mob_numbers  = [row.get(mob_col) for row in input_rows]
     unique_count = len({str(m).strip() for m in mob_numbers if m})
-    print(f"[MATCHOFF] {unique_count} unique mob numbers to match against mobilecleanup")
+    print(f"[MATCHOFF] {unique_count:,} unique mob numbers to match")
 
-    # ── 3. Chunked parallel PostgreSQL match ──
+    # 3. Chunked parallel match
     print(
-        f"[MATCHOFF] Querying mobilecleanup in chunks of {SQL_CHUNK_SIZE} "
-        f"with {SQL_MAX_WORKERS} parallel workers"
+        f"[MATCHOFF] Querying mobilecleanup: chunks={SQL_CHUNK_SIZE}, "
+        f"workers={SQL_MAX_WORKERS}"
     )
     matched_map = match_mob_numbers(mob_numbers)
-    print(f"[MATCHOFF] {len(matched_map)} unique numbers matched")
+    print(f"[MATCHOFF] {len(matched_map):,} unique numbers matched")
 
     if not matched_map:
         raise ValueError(
-            "Zero matches found. Check that the mob_col name is correct "
-            "and Phase 2 data has been loaded into mobilecleanup."
+            "Zero matches found. Verify mob_col name and that Phase 2 data "
+            "has been loaded into mobilecleanup."
         )
 
-    # ── 4. Build output Excel ──
-    base_name     = file_name.replace(".xlsx", "")
-    preview_count = sum(
+    # 4. Build output Excel
+    base_name        = file_name.replace(".xlsx", "")
+    matched_count_est = sum(
         1 for row in input_rows
         if str(row.get(mob_col, "")).strip() in matched_map
     )
-    output_file_name = f"{base_name}_matched_{preview_count}_records.xlsx"
+    output_file_name = f"{base_name}_matched_{matched_count_est}_records.xlsx"
 
     print(f"[MATCHOFF] Building output Excel: {output_file_name}")
     buf, matched_count = build_matched_excel(input_rows, headers, mob_col, matched_map)
 
-    # ── 5. Upload to matchoff-output/<date_folder>/ ──
+    # 5. Upload
     output_blob_path = upload_matchoff_output(buf, date_folder, output_file_name)
     print(f"[MATCHOFF] Uploaded → matchoff-output/{output_blob_path}")
 
-    # ── 6. Save metadata to PostgreSQL ──
+    # 6. Metadata
     run_id = save_matchoff_metadata(
         source_container   = source_container,
         source_date_folder = date_folder,
@@ -767,14 +854,14 @@ def run_matchoff(
         run_date           = run_date,
     )
 
-    # ── 7. 24-hour SAS URL for immediate download ──
+    # 7. 24-hour SAS URL
     sas_url = get_sas_download_url(
         container    = AZURE_CONTAINER_MATCHOFF_OUTPUT,
         blob_name    = output_blob_path,
         expiry_hours = 24,
     )
 
-    print(f"[MATCHOFF] Done. matched_count={matched_count}, run_id={run_id}")
+    print(f"[MATCHOFF] Done. matched_count={matched_count:,}, run_id={run_id}")
 
     return {
         "id":               run_id,

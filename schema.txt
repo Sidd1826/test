@@ -1,135 +1,17 @@
--- ═══════════════════════════════════════════════════════════════
--- DOT Intelligence Platform — PostgreSQL Schema (Azure)
--- All three tables live in the same Azure PostgreSQL instance.
--- Safe to re-run (all statements are idempotent).
--- ═══════════════════════════════════════════════════════════════
 
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- enables gen_random_uuid()
-
-
--- ═══════════════════════════════════════════════════════════════
--- TABLE 1 — export_files
--- Tracks every FRI / MNRL Excel exported to Azure Blob.
--- Written by Phase 1 (FRI) and Phase 2 (MNRL) after each export.
--- ═══════════════════════════════════════════════════════════════
-
-CREATE TABLE IF NOT EXISTS export_files (
-    id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-
-    module        VARCHAR(10)  NOT NULL
-                               CHECK (module IN ('FRI', 'MNRL')),
-
-    file_name     TEXT         NOT NULL,
-    blob_name     TEXT         NOT NULL,     -- path inside container: "2025-03-10/<file_name>"
-    container     TEXT         NOT NULL,     -- "fri-exports" | "mnrl-exports"
-
-    record_count  INTEGER      NOT NULL CHECK (record_count >= 0),
-    export_date   DATE         NOT NULL,
-
-    data_type     VARCHAR(20)  NULL
-                               CHECK (data_type IN ('Normal', 'Reactivated') OR data_type IS NULL),
-
-    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS jobs (
+    id           TEXT        PRIMARY KEY,
+    status       TEXT        NOT NULL DEFAULT 'pending',  -- pending | running | done | failed
+    result       JSONB,                                    -- populated when status = 'done'
+    error        TEXT,                                     -- last traceback line when status = 'failed'
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at  TIMESTAMPTZ,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_export_files_module
-    ON export_files (module, created_at DESC);
+-- Fast lookup for GET /export/status/<job_id>
+CREATE INDEX IF NOT EXISTS idx_jobs_id_status ON jobs (id, status);
 
-CREATE INDEX IF NOT EXISTS idx_export_files_id_module
-    ON export_files (id, module);
-
-
--- ═══════════════════════════════════════════════════════════════
--- TABLE 2 — mobilecleanup
--- Phase 2 scheduler TRUNCATES this table at 7 AM daily and
--- bulk-inserts ~30 lakh fresh records from the API response.
--- Phase 3 match-off queries this table to find cust_id
--- by matching final_mob_num against mob_num from the source Excel.
--- ═══════════════════════════════════════════════════════════════
-
-CREATE TABLE IF NOT EXISTS mobilecleanup (
-    cust_id       VARCHAR(100)  NULL,
-    mob_num       VARCHAR(50)   NULL,
-    final_mob_num VARCHAR(20)   NULL
-);
-
--- Critical for Phase 3 chunked IN-clause queries on 30L rows.
--- Without this every chunk does a full sequential scan.
-CREATE INDEX IF NOT EXISTS idx_mobilecleanup_final_mob_num
-    ON mobilecleanup (final_mob_num);
-
--- Speeds up lookups if you ever query by mob_num directly
-CREATE INDEX IF NOT EXISTS idx_mobilecleanup_mob_num
-    ON mobilecleanup (mob_num);
-
-
--- ═══════════════════════════════════════════════════════════════
--- TABLE 3 — matchoff_runs
--- Tracks every Phase 3 match-off execution.
--- One row per run: source file, output file, match statistics.
--- ═══════════════════════════════════════════════════════════════
-
-CREATE TABLE IF NOT EXISTS matchoff_runs (
-    id                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-
-    -- Source Excel (inside existing fri-exports / mnrl-exports blob)
-    source_container     TEXT         NOT NULL
-                                      CHECK (source_container IN ('fri-exports', 'mnrl-exports')),
-    source_date_folder   TEXT         NOT NULL,   -- "2025-03-10"
-    source_file_name     TEXT         NOT NULL,   -- "mnrl_normal_2025-03-10_50000_records.xlsx"
-
-    -- Output Excel (written to matchoff-output blob)
-    output_container     TEXT         NOT NULL DEFAULT 'matchoff-output',
-    output_blob_path     TEXT         NOT NULL,   -- "2025-03-10/..._matched_1234_records.xlsx"
-
-    -- Match statistics
-    input_row_count      INTEGER      NOT NULL DEFAULT 0 CHECK (input_row_count >= 0),
-    matched_count        INTEGER      NOT NULL DEFAULT 0 CHECK (matched_count   >= 0),
-
-    mob_column           TEXT         NOT NULL DEFAULT 'mob_num',
-
-    run_date             DATE         NOT NULL,
-    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-
-    CONSTRAINT chk_matched_lte_input CHECK (matched_count <= input_row_count)
-);
-
-CREATE INDEX IF NOT EXISTS idx_matchoff_runs_created_at
-    ON matchoff_runs (created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_matchoff_runs_container
-    ON matchoff_runs (source_container, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_matchoff_runs_date_folder
-    ON matchoff_runs (source_date_folder);
-
-
--- ═══════════════════════════════════════════════════════════════
--- USEFUL QUERIES
--- ═══════════════════════════════════════════════════════════════
-
--- Row count after Phase 2 bulk load (should be ~30 lakh)
--- SELECT COUNT(*) FROM mobilecleanup;
-
--- Check index is being used for match queries
--- EXPLAIN ANALYSE
--- SELECT final_mob_num, cust_id FROM mobilecleanup
--- WHERE  final_mob_num IN ('9876543210', '9123456780');
-
--- All MNRL exports newest first
--- SELECT id, file_name, record_count, data_type, export_date, created_at
--- FROM   export_files WHERE module = 'MNRL' ORDER BY created_at DESC;
-
--- Match-off runs with less than 50% match rate (worth investigating)
--- SELECT id, source_file_name, input_row_count, matched_count,
---        ROUND(matched_count::numeric / NULLIF(input_row_count, 0) * 100, 1) AS match_pct,
---        created_at
--- FROM   matchoff_runs
--- WHERE  matched_count::numeric / NULLIF(input_row_count, 0) < 0.5
--- ORDER  BY created_at DESC;
-
--- Latest matchoff run per container
--- SELECT DISTINCT ON (source_container)
---        source_container, source_file_name, matched_count, created_at
--- FROM   matchoff_runs
--- ORDER  BY source_container, created_at DESC;
+-- Fast cleanup queries (only scans finished rows)
+CREATE INDEX IF NOT EXISTS idx_jobs_finished_at ON jobs (finished_at)
+    WHERE finished_at IS NOT NULL;
