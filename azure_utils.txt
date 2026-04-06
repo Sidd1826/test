@@ -1,0 +1,483 @@
+import logging
+import time
+import re
+from typing import Optional, List, Dict, Tuple
+from itertools import islice
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+# BigQuery
+SERVICE_ACCOUNT_FILE = r"C:\Development\inm-gcp-service\serviceAccount.json"
+KMS_KEY_NAME = (
+    "projects/hsbc-6320774-kms-prod/locations/asia-south1"
+    "/keyRings/bigQuery/cryptoKeys/HSMbqSharedKey"
+)
+BQ_TABLE         = "hsbc-12123686-indp-prod.IN_MDL_HUB_MAIN_PROD.HUB_SSADDRP_RETN"
+PARTITION_FILTER = "PARTI_MONTH IS NOT NULL"
+DISTINCT_KEY_COL = "ZBTEN3"
+CUST_ID_COL      = "IP_SRCE_KEY"
+
+# Batching & retry
+BATCH_SIZE         = 1000
+SQL_INSERT_CHUNK   = 1000
+MAX_RETRIES        = 3
+RETRY_DELAY_SECONDS = 5
+
+# Azure SQL (PostgreSQL)
+SQL_SERVER   = "psql-inm-dev-inc-common.postgres.database.azure.com"
+SQL_DATABASE = "DOT_INDP"
+SQL_USERNAME = "azpgadmin"
+SQL_PASSWORD = "Admin@hsbc"
+SQL_TABLE    = "mobilecleanup"
+
+DEFAULT_COUNTRY_RES = "IN"
+
+# ─────────────────────────────────────────────
+# CONTROL TABLE DDL  (run once manually or let the pipeline create it)
+# ─────────────────────────────────────────────
+CONTROL_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_control (
+    pipeline_name  VARCHAR(100) PRIMARY KEY,
+    last_batch_dt  DATE,
+    last_run_ts    TIMESTAMP DEFAULT NOW(),
+    last_run_rows  INT
+);
+"""
+
+# Ensure mobilecleanup has a unique constraint on cust_id for ON CONFLICT to work.
+# Run once manually:
+#   ALTER TABLE mobilecleanup
+#       ADD CONSTRAINT mobilecleanup_cust_id_key UNIQUE (cust_id);
+
+PIPELINE_NAME = "mobile_cleanup_pipeline"
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# LOOKUP TABLES
+# ─────────────────────────────────────────────
+INDIAN_2D = {
+    "60","61","62","63","64","65","66","67","68","69",
+    "70","71","72","73","74","75","76","77","78","79",
+    "80","81","82","83","84","85","86","87","88","89",
+    "90","91","92","93","94","95","96","97","98","99",
+}
+INDIAN_800_SERIES = {"801","805","808","809","800"}
+
+INTL_COUNTRY_CONFIG = {
+    "971": 12, "966": 12, "974": 11, "973": 11,
+    "968": 11, "965": 11, "852": 11, "44":  12,
+    "65":  10, "61":  11,
+}
+INTL_VALID_SERIES = {
+    "973": {"36","38","39"},
+    "965": {"92","95","99","89"},
+    "968": {"92","95","99","89"},
+    "974": {"50","51","52","53","54","55"},
+    "966": {"50","53","54","55","56","57","58"},
+    "971": {"50","55","56"},
+    "852": {"90","91","92","93","94","96","97","98","81","82","83","85"},
+    "65":  {"90","91","92","93","94","96","97","98","81","82","83","85"},
+    "44":  {"74","75","77","78","79"},
+    "61":  {"40","41","42","43"},
+}
+COUNTRY_CODE_MAP = {
+    "AE":"971","SA":"966","QA":"974","BH":"973",
+    "OM":"968","KW":"965","HK":"852","SG":"65",
+    "GB":"44", "AU":"61",
+}
+INTL_COUNTRIES = set(COUNTRY_CODE_MAP.keys())
+
+
+# ─────────────────────────────────────────────
+# MOBILE CLEANING HELPERS
+# ─────────────────────────────────────────────
+def _strip_special_chars(number: str) -> str:
+    for delim in ["/","\\",","," or ","&","X",";","(","*","//","-"]:
+        idx = number.find(delim)
+        if idx > 0:
+            number = number[:idx]
+    number = number.replace(" ","")
+    number = re.sub(r"[^0-9+]","",number)
+    number = re.sub(r"^[^0-9]","",number)
+    return number.strip()
+
+
+def _normalise_intl_number(number: str, country_code: str) -> str:
+    cc_len   = len(country_code)
+    expected = INTL_COUNTRY_CONFIG[country_code]
+    sub_len  = expected - cc_len
+    for prefix, total_len in [
+        (f"0000{country_code}", 4 + cc_len + sub_len),
+        (f"000{country_code}",  3 + cc_len + sub_len),
+        (f"00{country_code}",   2 + cc_len + sub_len),
+        (f"0{country_code}",    1 + cc_len + sub_len),
+        (country_code,          expected),
+    ]:
+        if number.startswith(prefix):
+            return number[len(prefix) - cc_len:] if len(number) == total_len else number[len(prefix):]
+    return number
+
+
+def _clean_indian_domestic(raw: str) -> str:
+    if not raw:
+        return ""
+    number = _strip_special_chars(raw.strip())
+    number = re.sub(r"[^0-9]","",number)
+    if not number:
+        return ""
+    for prefix, expected_total in [
+        ("000919",16),("00919",15),("0919",14),("919",13),
+        ("000918",16),("00918",15),("0918",14),("918",13),
+        ("000917",16),("00917",15),("0917",14),("917",13),
+        ("000916",16),("00916",15),("0916",14),("916",13),
+    ]:
+        if number.startswith(prefix) and len(number) == expected_total:
+            number = number[len(prefix) - 2:]
+            break
+    if len(number) == 12 and number.startswith("91"):
+        number = number[2:]
+    for prefix in [
+        "090","091","092","093","094","095","096","097","098","099",
+        "081","082","083","084","085","086","087","088","089",
+        "070","071","072","073","074","075","076","077","078","079",
+        "060","061","062","063","064","065","066","067","068","069",
+        "0801","0805","0808","0809","0800",
+    ]:
+        if number.startswith(prefix):
+            if len(number) == 11:
+                number = number[1:]
+            elif len(number) != 10:
+                number = ""
+            break
+    if len(number) != 10:
+        return ""
+    if number[:2] in INDIAN_2D or number[:3] in INDIAN_800_SERIES:
+        return "91" + number
+    return ""
+
+
+def _clean_international(raw: str, country_res: str) -> str:
+    if not raw or not country_res:
+        return ""
+    number = re.sub(r"[^0-9+]","",raw.strip())
+    if number.startswith("+"):
+        number = number[1:]
+    number = re.sub(r"[^0-9]","",number)
+    if not number:
+        return ""
+    cc = COUNTRY_CODE_MAP.get(country_res.strip().upper())
+    if not cc:
+        return ""
+    expected  = INTL_COUNTRY_CONFIG.get(cc)
+    if not expected:
+        return ""
+    canonical = _normalise_intl_number(number, cc)
+    if not canonical or len(canonical) != expected:
+        return ""
+    series = canonical[len(cc): len(cc) + 2]
+    valid  = INTL_VALID_SERIES.get(cc, set())
+    if valid and series not in valid:
+        return ""
+    return canonical
+
+
+def clean_mobile_number(raw_telno: str, country_res: str = "IN") -> str:
+    """Returns cleaned mobile string, or '' if invalid."""
+    if not raw_telno or not str(raw_telno).strip():
+        return ""
+    raw        = str(raw_telno).strip()
+    country_res = (country_res or DEFAULT_COUNTRY_RES).strip().upper()
+    if country_res in INTL_COUNTRIES:
+        result = _clean_international(raw, country_res)
+        if result:
+            return result
+    domestic = _clean_indian_domestic(raw)
+    if domestic:
+        return domestic
+    digits_only = re.sub(r"[^0-9]","",raw)
+    if not re.search(r"[A-Za-z]",raw) and len(digits_only) in (10,12):
+        candidate = digits_only if len(digits_only) == 12 else "91" + digits_only
+        if candidate.startswith("91") and candidate[2] in "6789":
+            return candidate
+    return ""
+
+
+# ─────────────────────────────────────────────
+# BIGQUERY HELPERS
+# ─────────────────────────────────────────────
+def _make_bq_client() -> bigquery.Client:
+    credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
+    return bigquery.Client(credentials=credentials, project=credentials.project_id)
+
+
+def _make_job_config() -> bigquery.QueryJobConfig:
+    enc = bigquery.EncryptionConfiguration(kms_key_name=KMS_KEY_NAME)
+    return bigquery.QueryJobConfig(destination_encryption_configuration=enc)
+
+
+def run_query(client: bigquery.Client, query: str) -> List[Dict]:
+    job = client.query(query, job_config=_make_job_config())
+    return [dict(row) for row in job.result()]
+
+
+def get_total_count(client: bigquery.Client, batch_dt: str) -> int:
+    query = f"""
+        SELECT COUNT(1) AS total
+        FROM `{BQ_TABLE}`
+        WHERE {PARTITION_FILTER}
+          AND BATCH_DT = '{batch_dt}'
+    """
+    log.info("Fetching total row count for BATCH_DT=%s ...", batch_dt)
+    rows  = run_query(client, query)
+    total = int(rows[0]["total"])
+    log.info("Total rows for this batch_dt: %d", total)
+    return total
+
+
+def fetch_batch_with_retry(
+    client: bigquery.Client,
+    offset: int,
+    batch_size: int,
+    batch_dt: str,
+) -> List[Dict]:
+    query = f"""
+        SELECT {CUST_ID_COL}, {DISTINCT_KEY_COL}
+        FROM `{BQ_TABLE}`
+        WHERE {PARTITION_FILTER}
+          AND BATCH_DT = '{batch_dt}'
+        LIMIT {batch_size} OFFSET {offset}
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            log.info("BQ fetch offset=%-8d (attempt %d/%d)", offset, attempt, MAX_RETRIES)
+            rows = run_query(client, query)
+            log.info("  fetched %d rows", len(rows))
+            return rows
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Attempt %d failed: %s", attempt, exc)
+            if attempt < MAX_RETRIES:
+                log.info("Retrying in %ds", RETRY_DELAY_SECONDS)
+                time.sleep(RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        f"All {MAX_RETRIES} retries exhausted for offset={offset}"
+    ) from last_exc
+
+
+# ─────────────────────────────────────────────
+# AZURE SQL HELPERS
+# ─────────────────────────────────────────────
+def _get_sql_engine() -> Engine:
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        raise ImportError("pip install psycopg2-binary")
+    from urllib.parse import quote_plus
+    pwd = quote_plus(SQL_PASSWORD)
+    url = (
+        f"postgresql+psycopg2://{SQL_USERNAME}:{pwd}"
+        f"@{SQL_SERVER}/{SQL_DATABASE}"
+        f"?sslmode=require"
+    )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def ensure_control_table(engine: Engine) -> None:
+    """Create pipeline_control table if it doesn't exist."""
+    with engine.begin() as conn:
+        conn.execute(text(CONTROL_TABLE_DDL))
+    log.info("Control table ready.")
+
+
+def get_last_batch_dt(engine: Engine) -> Optional[str]:
+    """Return the last successfully processed BATCH_DT, or None if first run."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT last_batch_dt FROM pipeline_control "
+                "WHERE pipeline_name = :name"
+            ),
+            {"name": PIPELINE_NAME},
+        ).fetchone()
+    if row and row[0]:
+        return str(row[0])   # e.g. '2026-03-26'
+    return None
+
+
+def update_control_table(engine: Engine, batch_dt: str, rows_processed: int) -> None:
+    """Upsert the control record after a successful run."""
+    sql = text("""
+        INSERT INTO pipeline_control (pipeline_name, last_batch_dt, last_run_ts, last_run_rows)
+        VALUES (:name, :batch_dt, NOW(), :rows)
+        ON CONFLICT (pipeline_name)
+        DO UPDATE SET
+            last_batch_dt = EXCLUDED.last_batch_dt,
+            last_run_ts   = EXCLUDED.last_run_ts,
+            last_run_rows = EXCLUDED.last_run_rows
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, {"name": PIPELINE_NAME, "batch_dt": batch_dt, "rows": rows_processed})
+    log.info("Control table updated: last_batch_dt=%s rows=%d", batch_dt, rows_processed)
+
+
+def _chunked(iterable, size: int):
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            break
+        yield chunk
+
+
+def upsert_rows(engine: Engine, rows: List[Tuple[str, str, str]]) -> int:
+    """
+    Upsert rows into mobilecleanup.
+    ON CONFLICT (cust_id) → update mob_num and final_mob_num.
+
+    Prerequisite (run once on DB):
+        ALTER TABLE mobilecleanup
+            ADD CONSTRAINT mobilecleanup_cust_id_key UNIQUE (cust_id);
+    """
+    sql = text(f"""
+        INSERT INTO {SQL_TABLE} (cust_id, mob_num, final_mob_num)
+        VALUES (:cust_id, :mob_num, :final_mob_num)
+        ON CONFLICT (cust_id)
+        DO UPDATE SET
+            mob_num       = EXCLUDED.mob_num,
+            final_mob_num = EXCLUDED.final_mob_num
+    """)
+    total = 0
+    with engine.begin() as conn:
+        for chunk in _chunked(rows, SQL_INSERT_CHUNK):
+            params = [
+                {"cust_id": r[0], "mob_num": r[1], "final_mob_num": r[2]}
+                for r in chunk
+            ]
+            conn.execute(sql, params)
+            total += len(chunk)
+    return total
+
+
+# ─────────────────────────────────────────────
+# ORCHESTRATOR
+# ─────────────────────────────────────────────
+def run_pipeline(batch_dt: str) -> None:
+    """
+    Incremental pipeline:
+      1. Read last processed BATCH_DT from control table.
+      2. If today's BATCH_DT already processed → skip.
+      3. Fetch only today's rows from BQ (filtered by BATCH_DT).
+      4. Clean mobile numbers.
+      5. UPSERT into Azure SQL  (no TRUNCATE, no full reload).
+      6. Update control table.
+    """
+    log.info("=" * 60)
+    log.info("Pipeline START  |  batch_dt=%s", batch_dt)
+    log.info("BQ  Table : %s", BQ_TABLE)
+    log.info("SQL Table : %s", SQL_TABLE)
+    log.info("=" * 60)
+
+    # Step A – DB setup
+    log.info("Step A: connecting to Azure SQL...")
+    sql_engine = _get_sql_engine()
+    ensure_control_table(sql_engine)
+
+    # Step B – Guard: skip if already processed today
+    last_dt = get_last_batch_dt(sql_engine)
+    if last_dt == batch_dt:
+        log.info("batch_dt=%s already processed. Nothing to do. Exiting.", batch_dt)
+        sql_engine.dispose()
+        return
+    log.info("Last processed batch_dt: %s  →  processing: %s", last_dt, batch_dt)
+
+    # Step C – BigQuery client & row count
+    log.info("Step C: creating BigQuery client...")
+    bq_client = _make_bq_client()
+
+    total_rows = get_total_count(bq_client, batch_dt)
+    if total_rows == 0:
+        log.warning("No rows found for batch_dt=%s. Exiting.", batch_dt)
+        sql_engine.dispose()
+        return
+
+    num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # Step D – Fetch → clean → upsert loop
+    total_fetched  = 0
+    total_skipped  = 0
+    total_upserted = 0
+
+    for batch_num in range(num_batches):
+        offset   = batch_num * BATCH_SIZE
+        raw_rows = fetch_batch_with_retry(bq_client, offset, BATCH_SIZE, batch_dt)
+
+        if not raw_rows:
+            log.info("Empty batch at offset %d, stopping early.", offset)
+            break
+
+        total_fetched    += len(raw_rows)
+        has_country_col   = "COUNTRY_RES" in raw_rows[0]
+        insert_rows: List[Tuple[str, str, str]] = []
+
+        for row in raw_rows:
+            cust_id     = str(row.get(CUST_ID_COL, "") or "")
+            mob_num     = str(row.get(DISTINCT_KEY_COL, "") or "")
+            country_res = (
+                str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
+                if has_country_col else DEFAULT_COUNTRY_RES
+            )
+            final_mob_num = clean_mobile_number(mob_num, country_res)
+
+            if not final_mob_num:
+                total_skipped += 1
+                continue
+
+            insert_rows.append((cust_id, mob_num, final_mob_num))
+
+        upserted        = upsert_rows(sql_engine, insert_rows)
+        total_upserted += upserted
+
+        log.info(
+            "Batch %d/%d | fetched=%d skipped=%d upserted=%d cumulative=%d",
+            batch_num + 1, num_batches,
+            len(raw_rows),
+            len(raw_rows) - len(insert_rows),
+            upserted,
+            total_upserted,
+        )
+
+    # Step E – Update control table (only on full success)
+    update_control_table(sql_engine, batch_dt, total_upserted)
+
+    sql_engine.dispose()
+
+    log.info("-" * 60)
+    log.info("Pipeline COMPLETE")
+    log.info("Total fetched  : %d", total_fetched)
+    log.info("Total skipped  : %d (empty/invalid mobile)", total_skipped)
+    log.info("Total upserted : %d", total_upserted)
+    log.info("-" * 60)
+
+
+if __name__ == "__main__":
+    import datetime
+    # Automatically use yesterday's BATCH_DT (adjust if your BQ uses today's date)
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    run_pipeline(batch_dt=yesterday)
