@@ -1,70 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import io
-import csv
-import psycopg2
-
-def bulk_insert_rows(engine: Engine, rows: List[Tuple[str, str, str]]) -> int:
-    """Use COPY instead of INSERT — 10-50x faster for bulk loads."""
-    if not rows:
-        return 0
-
-    # Write rows into an in-memory CSV buffer
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
-    writer.writerows(rows)
-    buffer.seek(0)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            raw_conn = engine.raw_connection()
-            try:
-                with raw_conn.cursor() as cursor:
-                    cursor.copy_expert(
-                        f"COPY {SQL_TABLE} (cust_id, mob_num, final_mob_num) "
-                        f"FROM STDIN WITH (FORMAT CSV)",
-                        buffer,
-                    )
-                raw_conn.commit()
-            finally:
-                raw_conn.close()
-            return len(rows)
-
-        except psycopg2.OperationalError as exc:
-            log.warning("COPY failed attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
-            buffer.seek(0)  # reset buffer for retry
-            if attempt == MAX_RETRIES:
-                raise
-            time.sleep(RETRY_DELAY_SECONDS)
-
-    return 0
-
-
-def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]:
-    """Fetch from BQ and clean in one callable — runs in a thread."""
-    raw_rows = fetch_batch_with_retry(offset, batch_size)
-    if not raw_rows:
-        return [], 0, 0
-
-    has_country_col = "COUNTRY_RES" in raw_rows[0]
-    insert_rows = []
-    skipped = 0
-
-    for row in raw_rows:
-        cust_id     = str(row.get(CUST_ID_COL, "") or "")
-        mob_num     = str(row.get(DISTINCT_KEY_COL, "") or "")
-        country_res = (
-            str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
-            if has_country_col else DEFAULT_COUNTRY_RES
-        )
-        final_mob_num = clean_mobile_number(mob_num, country_res)
-        if not final_mob_num:
-            skipped += 1
-            continue
-        insert_rows.append((cust_id, mob_num, final_mob_num))
-
-    return insert_rows, len(raw_rows), skipped
-
+import io, csv
 
 def run_pipeline() -> None:
     log.info("=" * 60)
@@ -79,8 +14,17 @@ def run_pipeline() -> None:
         log.warning("No rows found – pipeline exiting.")
         return
 
-    num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
-    log.info("Total rows=%d  batches=%d  batch_size=%d", total_rows, num_batches, BATCH_SIZE)
+    # ── Fix 1: compute exact batch sizes so last batch doesn't over-fetch ──
+    offsets = []
+    for b in range(0, total_rows, BATCH_SIZE):
+        actual_size = min(BATCH_SIZE, total_rows - b)  # cap last batch
+        offsets.append((b, actual_size))
+
+    num_batches = len(offsets)
+    log.info(
+        "Total rows=%d  batches=%d  batch_size=%d  last_batch_size=%d",
+        total_rows, num_batches, BATCH_SIZE, offsets[-1][1],
+    )
 
     sql_engine = _get_sql_engine()
     truncate_table(sql_engine)
@@ -90,85 +34,67 @@ def run_pipeline() -> None:
     total_inserted = 0
     pipeline_start = time.time()
 
-    # ── how many batches to fetch+clean in parallel ──────────────────────
-    # Keep at 3-5; too many parallel BQ queries will hit quota limits
     MAX_WORKERS = int(os.environ.get("PIPELINE_WORKERS", 4))
-
-    offsets = [b * BATCH_SIZE for b in range(num_batches)]
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # ── Fix 1 cont: pass actual_size per batch, not global BATCH_SIZE ──
             futures = {
-                executor.submit(fetch_and_clean_batch, offset, BATCH_SIZE): offset
-                for offset in offsets
+                executor.submit(fetch_and_clean_batch, offset, size): (batch_num, offset, size)
+                for batch_num, (offset, size) in enumerate(offsets, 1)
             }
 
             for future in as_completed(futures):
-                offset = futures[future]
+                batch_num, offset, size = futures[future]
                 batch_start = time.time()
+
+                # ── Fix 2: structured log block per batch ──────────────────
+                log.info("─" * 60)
+                log.info("BATCH %d/%d  (offset=%d  expected=%d rows)",
+                         batch_num, num_batches, offset, size)
 
                 try:
                     insert_rows, fetched, skipped = future.result()
                 except Exception as exc:
-                    log.error("Batch at offset=%d failed: %s", offset, exc)
+                    log.error("  [FETCH+CLEAN] FAILED: %s", exc)
                     continue
+
+                log.info("  [FETCH]  rows fetched  : %d", fetched)
+                log.info("  [CLEAN]  valid         : %d", fetched - skipped)
+                log.info("  [CLEAN]  skipped       : %d  (invalid/empty mobile)", skipped)
+
+                if insert_rows:
+                    log.info("  [INSERT] starting COPY of %d rows ...", len(insert_rows))
+                    insert_start = time.time()
+                    inserted     = bulk_insert_rows(sql_engine, insert_rows)
+                    log.info("  [INSERT] done — %d rows in %.2fs",
+                             inserted, time.time() - insert_start)
+                else:
+                    inserted = 0
+                    log.info("  [INSERT] skipped — no valid rows")
 
                 total_fetched  += fetched
                 total_skipped  += skipped
+                total_inserted += inserted
 
-                if insert_rows:
-                    inserted        = bulk_insert_rows(sql_engine, insert_rows)
-                    total_inserted += inserted
-                else:
-                    inserted = 0
-
-                log.info(
-                    "offset=%-8d  fetched=%d  skipped=%d  inserted=%d  "
-                    "cumulative=%d  time=%.2fs",
-                    offset, fetched, skipped, inserted,
-                    total_inserted,
-                    time.time() - batch_start,
-                )
+                log.info("  [BATCH]  time          : %.2fs", time.time() - batch_start)
+                log.info("  [TOTAL]  cumulative inserted: %d / ~%d",
+                         total_inserted, total_rows)
 
     finally:
         sql_engine.dispose()
+        log.info("=" * 60)
         log.info("SQL engine disposed.")
 
     total_elapsed = time.time() - pipeline_start
-    log.info("-" * 60)
+    log.info("=" * 60)
     log.info("Pipeline COMPLETE")
-    log.info("Total fetched      : %d", total_fetched)
-    log.info("Total skipped      : %d", total_skipped)
-    log.info("Total inserted     : %d", total_inserted)
-    log.info("Total time elapsed : %.2fs  (%.1f min)", total_elapsed, total_elapsed / 60)
-    log.info("-" * 60)
-
-def drop_indexes(engine: Engine) -> None:
-    log.info("Dropping indexes before bulk load...")
-    with engine.begin() as conn:
-        conn.execute(text("DROP INDEX IF EXISTS idx_mobilecleanup_final_mob_num"))
-        conn.execute(text("DROP INDEX IF EXISTS idx_mobilecleanup_mob_num"))
-    log.info("Indexes dropped.")
-
-
-def recreate_indexes(engine: Engine) -> None:
-    log.info("Recreating indexes after bulk load...")
-    start = time.time()
-    with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE INDEX idx_mobilecleanup_final_mob_num "
-            "ON mobilecleanup (final_mob_num)"
-        ))
-        conn.execute(text(
-            "CREATE INDEX idx_mobilecleanup_mob_num "
-            "ON mobilecleanup (mob_num)"
-        ))
-    log.info("Indexes recreated in %.2fs", time.time() - start)
-
-
-def truncate_table(engine: Engine) -> None:
-    log.info("Truncating table %s ...", SQL_TABLE)
-    with engine.begin() as conn:
-        # TRUNCATE is faster than DELETE and also resets index bloat
-        conn.execute(text(f"TRUNCATE TABLE {SQL_TABLE}"))
-    log.info("Table truncated.")
+    log.info("  Total rows in BQ   : %d", total_rows)
+    log.info("  Total fetched      : %d", total_fetched)
+    log.info("  Total skipped      : %d  (%.1f%%)",
+             total_skipped, (total_skipped / total_fetched * 100) if total_fetched else 0)
+    log.info("  Total inserted     : %d  (%.1f%%)",
+             total_inserted, (total_inserted / total_fetched * 100) if total_fetched else 0)
+    log.info("  Time elapsed       : %.2fs  (%.1f min)",
+             total_elapsed, total_elapsed / 60)
+    log.info("=" * 60)
