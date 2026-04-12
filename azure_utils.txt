@@ -1,64 +1,174 @@
-pipeline_start = time.time()
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import io
+import csv
+import psycopg2
+
+def bulk_insert_rows(engine: Engine, rows: List[Tuple[str, str, str]]) -> int:
+    """Use COPY instead of INSERT — 10-50x faster for bulk loads."""
+    if not rows:
+        return 0
+
+    # Write rows into an in-memory CSV buffer
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerows(rows)
+    buffer.seek(0)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw_conn = engine.raw_connection()
+            try:
+                with raw_conn.cursor() as cursor:
+                    cursor.copy_expert(
+                        f"COPY {SQL_TABLE} (cust_id, mob_num, final_mob_num) "
+                        f"FROM STDIN WITH (FORMAT CSV)",
+                        buffer,
+                    )
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+            return len(rows)
+
+        except psycopg2.OperationalError as exc:
+            log.warning("COPY failed attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
+            buffer.seek(0)  # reset buffer for retry
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    return 0
+
+
+def fetch_and_clean_batch(offset: int, batch_size: int) -> Tuple[List, int, int]:
+    """Fetch from BQ and clean in one callable — runs in a thread."""
+    raw_rows = fetch_batch_with_retry(offset, batch_size)
+    if not raw_rows:
+        return [], 0, 0
+
+    has_country_col = "COUNTRY_RES" in raw_rows[0]
+    insert_rows = []
+    skipped = 0
+
+    for row in raw_rows:
+        cust_id     = str(row.get(CUST_ID_COL, "") or "")
+        mob_num     = str(row.get(DISTINCT_KEY_COL, "") or "")
+        country_res = (
+            str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
+            if has_country_col else DEFAULT_COUNTRY_RES
+        )
+        final_mob_num = clean_mobile_number(mob_num, country_res)
+        if not final_mob_num:
+            skipped += 1
+            continue
+        insert_rows.append((cust_id, mob_num, final_mob_num))
+
+    return insert_rows, len(raw_rows), skipped
+
+
+def run_pipeline() -> None:
+    log.info("=" * 60)
+    log.info("Pipeline START")
+    log.info("BQ Table : %s", BQ_TABLE)
+    log.info("Filter   : %s", PARTITION_FILTER)
+    log.info("SQL Table: %s", SQL_TABLE)
+    log.info("=" * 60)
+
+    total_rows = get_total_count()
+    if total_rows == 0:
+        log.warning("No rows found – pipeline exiting.")
+        return
+
+    num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+    log.info("Total rows=%d  batches=%d  batch_size=%d", total_rows, num_batches, BATCH_SIZE)
+
+    sql_engine = _get_sql_engine()
+    truncate_table(sql_engine)
+
+    total_fetched  = 0
+    total_skipped  = 0
+    total_inserted = 0
+    pipeline_start = time.time()
+
+    # ── how many batches to fetch+clean in parallel ──────────────────────
+    # Keep at 3-5; too many parallel BQ queries will hit quota limits
+    MAX_WORKERS = int(os.environ.get("PIPELINE_WORKERS", 4))
+
+    offsets = [b * BATCH_SIZE for b in range(num_batches)]
 
     try:
-        for batch_num in range(num_batches):
-            batch_start = time.time()
-            offset      = batch_num * BATCH_SIZE
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(fetch_and_clean_batch, offset, BATCH_SIZE): offset
+                for offset in offsets
+            }
 
-            raw_rows = fetch_batch_with_retry(offset, BATCH_SIZE)
-            if not raw_rows:
-                log.info("Empty batch at offset %d – stopping early.", offset)
-                break
+            for future in as_completed(futures):
+                offset = futures[future]
+                batch_start = time.time()
 
-            total_fetched   += len(raw_rows)
-            has_country_col  = "COUNTRY_RES" in raw_rows[0]
+                try:
+                    insert_rows, fetched, skipped = future.result()
+                except Exception as exc:
+                    log.error("Batch at offset=%d failed: %s", offset, exc)
+                    continue
 
-            batch_inserted = 0
-            batch_skipped  = 0
-
-            # ── process and insert in SQL_INSERT_CHUNK sub-chunks ──────────
-            for sub_chunk in _chunked(raw_rows, SQL_INSERT_CHUNK):
-                insert_rows: List[Tuple[str, str, str]] = []
-
-                for row in sub_chunk:
-                    cust_id     = str(row.get(CUST_ID_COL, "") or "")
-                    mob_num     = str(row.get(DISTINCT_KEY_COL, "") or "")
-                    country_res = (
-                        str(row.get("COUNTRY_RES", "") or DEFAULT_COUNTRY_RES)
-                        if has_country_col
-                        else DEFAULT_COUNTRY_RES
-                    )
-                    final_mob_num = clean_mobile_number(mob_num, country_res)
-
-                    if not final_mob_num:
-                        batch_skipped += 1
-                        continue
-
-                    insert_rows.append((cust_id, mob_num, final_mob_num))
+                total_fetched  += fetched
+                total_skipped  += skipped
 
                 if insert_rows:
                     inserted        = bulk_insert_rows(sql_engine, insert_rows)
-                    batch_inserted += inserted
+                    total_inserted += inserted
+                else:
+                    inserted = 0
 
                 log.info(
-                    "  Sub-chunk done — cleaned=%d  skipped=%d  inserted=%d",
-                    len(insert_rows),
-                    batch_skipped,
-                    batch_inserted,
+                    "offset=%-8d  fetched=%d  skipped=%d  inserted=%d  "
+                    "cumulative=%d  time=%.2fs",
+                    offset, fetched, skipped, inserted,
+                    total_inserted,
+                    time.time() - batch_start,
                 )
 
-            total_skipped  += batch_skipped
-            total_inserted += batch_inserted
-            batch_elapsed   = time.time() - batch_start
+    finally:
+        sql_engine.dispose()
+        log.info("SQL engine disposed.")
 
-            log.info(
-                "Batch %d/%d  fetched=%d  skipped=%d  inserted=%d  "
-                "cumulative=%d  batch_time=%.2fs",
-                batch_num + 1,
-                num_batches,
-                len(raw_rows),
-                batch_skipped,
-                batch_inserted,
-                total_inserted,
-                batch_elapsed,
-            )
+    total_elapsed = time.time() - pipeline_start
+    log.info("-" * 60)
+    log.info("Pipeline COMPLETE")
+    log.info("Total fetched      : %d", total_fetched)
+    log.info("Total skipped      : %d", total_skipped)
+    log.info("Total inserted     : %d", total_inserted)
+    log.info("Total time elapsed : %.2fs  (%.1f min)", total_elapsed, total_elapsed / 60)
+    log.info("-" * 60)
+
+def drop_indexes(engine: Engine) -> None:
+    log.info("Dropping indexes before bulk load...")
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX IF EXISTS idx_mobilecleanup_final_mob_num"))
+        conn.execute(text("DROP INDEX IF EXISTS idx_mobilecleanup_mob_num"))
+    log.info("Indexes dropped.")
+
+
+def recreate_indexes(engine: Engine) -> None:
+    log.info("Recreating indexes after bulk load...")
+    start = time.time()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX idx_mobilecleanup_final_mob_num "
+            "ON mobilecleanup (final_mob_num)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX idx_mobilecleanup_mob_num "
+            "ON mobilecleanup (mob_num)"
+        ))
+    log.info("Indexes recreated in %.2fs", time.time() - start)
+
+
+def truncate_table(engine: Engine) -> None:
+    log.info("Truncating table %s ...", SQL_TABLE)
+    with engine.begin() as conn:
+        # TRUNCATE is faster than DELETE and also resets index bloat
+        conn.execute(text(f"TRUNCATE TABLE {SQL_TABLE}"))
+    log.info("Table truncated.")
