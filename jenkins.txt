@@ -1,0 +1,285 @@
+pipeline {
+    agent {
+        label 'cm-linux'
+    }
+    
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        ansiColor('xterm')
+        buildDiscarder(logRotator(daysToKeepStr: '365', numToKeepStr: '14', artifactNumToKeepStr: '1'))
+        disableConcurrentBuilds()
+        disableResume()
+        timestamps()
+    }
+    
+    parameters {
+        choice(name: 'GOOGLE_CLOUD_RUN_SERVICE_NAME', 
+               choices: ["billdesk_webhook_new", "email"],
+               description: 'Source folder name in GitHub. "_new" suffix will be stripped for GCP resource names.')
+        booleanParam(name: 'PUBLISH_TEST_MESSAGE', defaultValue: true, description: 'Publish a test message after subscription creation')
+        string(name: 'TEST_MESSAGE', defaultValue: 'Hello from Pub/Sub!', description: 'Test message body')
+    }
+    
+    environment {
+        PROJECT_ID            = "hsbc-243862-hifsllasuat-dev"
+        GOOGLE_PROXY_HOST     = "googleapis-dev.dev.gcp.cloud.in.hsbc"
+        GOOGLE_PROXY_PORT     = "3128"
+        GOOGLE_FULL_PROXY_URL = "http://${GOOGLE_PROXY_HOST}:${GOOGLE_PROXY_PORT}"
+        SHORT_COMMIT_ID       = "${GIT_COMMIT[0..7]}"
+        MY_REGION             = "asia-south1"
+        MY_VPC_CONNECTOR      = "projects/hsbc-243862-hifsllasuat-dev/locations/asia-south1/connectors/vpc1-asia-south1"
+        MY_SA_EMAIL           = "gce-workload@hsbc-243862-hifsllasuat-dev.iam.gserviceaccount.com"
+        
+        // KMS keys
+        RUN_KMS    = "projects/hsbc-6320774-kms-dev/locations/asia-south1/keyRings/run/cryptokeys/runSharedKey"
+        PUBSUB_KMS = "projects/hsbc-6320774-kms-dev/locations/asia-south1/keyRings/pubSub/cryptokeys/pubSub"
+        
+        // Artifact Registry
+        AR_HOST    = "asia-south1-docker.pkg.dev"
+        AR_REPO    = "fifty-fin-cloud-run-functions-asia-south1"
+        AR_PROJECT = "hsbc-243862-hifsllasuat-dev"
+    }
+    
+    stages {
+        
+        stage("Resolve Service Names") {
+            steps {
+                script {
+                    // Folder name from GitHub (used for build context / cd into folder)
+                    env.SOURCE_FOLDER = params.GOOGLE_CLOUD_RUN_SERVICE_NAME
+                    
+                    // Strip trailing "_new" for all GCP resource names
+                    env.SERVICE_NAME = params.GOOGLE_CLOUD_RUN_SERVICE_NAME.replaceAll(/_new$/, '')
+                    
+                    // Derive everything from the cleaned name
+                    env.IMAGE_NAME           = env.SERVICE_NAME
+                    env.PUBSUB_TOPIC         = env.SERVICE_NAME
+                    env.PUBSUB_SUBSCRIPTION  = env.SERVICE_NAME
+                    env.PUSH_ENDPOINT_PATH   = "/${env.SERVICE_NAME}"
+                    
+                    // Build the docker tag URL with the cleaned image name
+                    env.DOCKER_TAG_URL = "${env.AR_HOST}/${env.AR_PROJECT}/${env.AR_REPO}/${env.IMAGE_NAME}"
+                    
+                    echo "============================================="
+                    echo "Source folder:     ${env.SOURCE_FOLDER}"
+                    echo "Service name:      ${env.SERVICE_NAME}"
+                    echo "Image name:        ${env.IMAGE_NAME}"
+                    echo "Docker tag URL:    ${env.DOCKER_TAG_URL}"
+                    echo "Topic:             ${env.PUBSUB_TOPIC}"
+                    echo "Subscription:      ${env.PUBSUB_SUBSCRIPTION}"
+                    echo "Push endpoint path: ${env.PUSH_ENDPOINT_PATH}"
+                    echo "============================================="
+                }
+            }
+        }
+        
+        stage("Gcloud Pre-requisite setup") {
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    sh '''
+                        gcloud config set proxy/type http
+                        gcloud config set proxy/address ${GOOGLE_PROXY_HOST}
+                        gcloud config set proxy/port ${GOOGLE_PROXY_PORT}
+                        gcloud auth activate-service-account --key-file=$SERVICE_ACC_FILE --project=$PROJECT_ID
+                        gcloud auth configure-docker ${AR_HOST}
+                        gcloud config list
+                    '''
+                }
+            }
+        }
+        
+        stage("Copying all secret files") {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'SECRET_NEXUS3', variable: 'SECRET_NEXUS3'),
+                    file(credentialsId: 'pip_conf', variable: 'pip_conf'),
+                    file(credentialsId: 'SOURCES_LIST', variable: 'SOURCES_LIST'),
+                    file(credentialsId: 'DOCKER_CONFIG_JSON', variable: 'DOCKER_CONFIG_JSON')
+                ]) {
+                    sh '''
+                        cp ${pip_conf} .
+                        cp ${SECRET_NEXUS3} .
+                        cp ${SOURCES_LIST} .
+                        cp ${DOCKER_CONFIG_JSON} .
+                    '''
+                }
+            }
+        }
+        
+        stage("Docker build") {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'DOCKER_CONFIG_JSON', variable: 'DOCKER_CONFIG_JSON_FILE'),
+                    file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE'),
+                    file(credentialsId: 'pip_conf', variable: 'pip_conf'),
+                    file(credentialsId: 'SECRET_NEXUS3', variable: 'SECRET_NEXUS3'),
+                    file(credentialsId: 'SOURCES_LIST', variable: 'SOURCES_LIST')
+                ]) {
+                    sh 'gcloud auth configure-docker asia-south1-docker.pkg.dev'
+                    sh 'gcloud config list'
+                    
+                    container(name: 'kaniko', shell: '/busybox/sh') {
+                        sh '''
+                            export DOCKER_CONFIG=/kaniko/.docker
+                            cp ${DOCKER_CONFIG_JSON_FILE} /kaniko/.docker/config.json
+                            export https_proxy=http://googleapis-dev.dev.gcp.cloud.in.hsbc:3128
+                            export no_proxy=uk.hsbc
+                            ls -ltr
+                            cd ${SOURCE_FOLDER}
+                            cp ${pip_conf} .
+                            cp ${SECRET_NEXUS3} .
+                            cp ${SOURCES_LIST} .
+                            ls -lrt
+                            /kaniko/executor --context `pwd` -f Dockerfile \
+                                --skip-tls-verify \
+                                -d "${DOCKER_TAG_URL}":"${SHORT_COMMIT_ID}"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage("Resolve Image Digest") {
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    script {
+                        // Resolve the image to its sha256 digest for immutable deployments
+                        env.IMAGE_DIGEST = sh(
+                            returnStdout: true,
+                            script: '''
+                                gcloud artifacts docker images describe \
+                                    "${DOCKER_TAG_URL}:${SHORT_COMMIT_ID}" \
+                                    --format='value(image_summary.digest)'
+                            '''
+                        ).trim()
+                        
+                        env.MY_IMAGE = "${env.DOCKER_TAG_URL}@${env.IMAGE_DIGEST}"
+                        echo "Resolved image: ${env.MY_IMAGE}"
+                    }
+                }
+            }
+        }
+        
+        stage("Deploy to Cloud Run") {
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    sh '''
+                        gcloud run deploy ${SERVICE_NAME} \
+                            --ingress=internal \
+                            --max-instances=1 \
+                            --port=8080 \
+                            --service-account=${MY_SA_EMAIL} \
+                            --image=${MY_IMAGE} \
+                            --no-allow-unauthenticated \
+                            --vpc-connector=${MY_VPC_CONNECTOR} \
+                            --vpc-egress=all-traffic \
+                            --region=${MY_REGION} \
+                            --key=${RUN_KMS} \
+                            --binary-authorization=default \
+                            --set-env-vars=ENV=dev,project=hifsl \
+                            --project=${PROJECT_ID}
+                    '''
+                    
+                    script {
+                        // Capture the deployed Cloud Run service URL
+                        env.CLOUD_RUN_URL = sh(
+                            returnStdout: true,
+                            script: '''
+                                gcloud run services describe ${SERVICE_NAME} \
+                                    --region=${MY_REGION} \
+                                    --project=${PROJECT_ID} \
+                                    --format='value(status.url)'
+                            '''
+                        ).trim()
+                        env.PUSH_ENDPOINT = "${env.CLOUD_RUN_URL}${env.PUSH_ENDPOINT_PATH}"
+                        echo "Cloud Run URL: ${env.CLOUD_RUN_URL}"
+                        echo "Full push endpoint: ${env.PUSH_ENDPOINT}"
+                    }
+                }
+            }
+        }
+        
+        stage("Create Pub/Sub Topic") {
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    sh '''
+                        # Idempotent: create only if topic does not already exist
+                        if gcloud pubsub topics describe ${PUBSUB_TOPIC} \
+                            --project=${PROJECT_ID} >/dev/null 2>&1; then
+                            echo "Topic ${PUBSUB_TOPIC} already exists. Skipping creation."
+                        else
+                            echo "Creating topic ${PUBSUB_TOPIC}..."
+                            gcloud pubsub topics create ${PUBSUB_TOPIC} \
+                                --topic-encryption-key=${PUBSUB_KMS} \
+                                --project=${PROJECT_ID}
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage("Create Pub/Sub Subscription") {
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    sh '''
+                        # Idempotent: create if missing, otherwise update push endpoint
+                        if gcloud pubsub subscriptions describe ${PUBSUB_SUBSCRIPTION} \
+                            --project=${PROJECT_ID} >/dev/null 2>&1; then
+                            echo "Subscription ${PUBSUB_SUBSCRIPTION} already exists. Updating push endpoint..."
+                            gcloud pubsub subscriptions update ${PUBSUB_SUBSCRIPTION} \
+                                --push-endpoint=${PUSH_ENDPOINT} \
+                                --push-auth-service-account=${MY_SA_EMAIL} \
+                                --project=${PROJECT_ID}
+                        else
+                            echo "Creating subscription ${PUBSUB_SUBSCRIPTION}..."
+                            gcloud pubsub subscriptions create ${PUBSUB_SUBSCRIPTION} \
+                                --topic=${PUBSUB_TOPIC} \
+                                --topic-project=${PROJECT_ID} \
+                                --ack-deadline=10 \
+                                --expiration-period=never \
+                                --message-retention-duration=604800s \
+                                --push-endpoint=${PUSH_ENDPOINT} \
+                                --push-auth-service-account=${MY_SA_EMAIL} \
+                                --project=${PROJECT_ID}
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage("Publish Test Message") {
+            when {
+                expression { return params.PUBLISH_TEST_MESSAGE }
+            }
+            steps {
+                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+                    sh '''
+                        echo "Publishing test message to topic ${PUBSUB_TOPIC}..."
+                        gcloud pubsub topics publish ${PUBSUB_TOPIC} \
+                            --message="${TEST_MESSAGE}" \
+                            --project=${PROJECT_ID}
+                        echo "Message published successfully."
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "============================================="
+            echo "Pipeline completed successfully."
+            echo "Source folder:     ${env.SOURCE_FOLDER}"
+            echo "Service name:      ${env.SERVICE_NAME}"
+            echo "Image:             ${env.MY_IMAGE}"
+            echo "Cloud Run URL:     ${env.CLOUD_RUN_URL}"
+            echo "Push endpoint:     ${env.PUSH_ENDPOINT}"
+            echo "Topic:             ${env.PUBSUB_TOPIC}"
+            echo "Subscription:      ${env.PUBSUB_SUBSCRIPTION}"
+            echo "============================================="
+        }
+        failure {
+            echo "Pipeline failed. Check logs above for details."
+        }
+    }
+}
