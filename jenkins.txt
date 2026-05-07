@@ -14,14 +14,15 @@ pipeline {
     
     parameters {
         choice(name: 'GOOGLE_CLOUD_RUN_SERVICE_NAME', 
-               choices: ["billdesk_webhook_new", "email"],
-               description: 'Source folder name in GitHub. "_new" suffix will be stripped for GCP resource names.')
+               choices: ["billdesk_webhook_new", "email", "internal_risk_management_new"],
+               description: 'Source folder name in GitHub. "_new" suffix is stripped and underscores become hyphens for GCP resources.')
         booleanParam(name: 'PUBLISH_TEST_MESSAGE', defaultValue: true, description: 'Publish a test message after subscription creation')
         string(name: 'TEST_MESSAGE', defaultValue: 'Hello from Pub/Sub!', description: 'Test message body')
     }
     
     environment {
         PROJECT_ID            = "hsbc-243862-hifsllasuat-dev"
+        PROJECT_NUMBER        = "313353420070"
         GOOGLE_PROXY_HOST     = "googleapis-dev.dev.gcp.cloud.in.hsbc"
         GOOGLE_PROXY_PORT     = "3128"
         GOOGLE_FULL_PROXY_URL = "http://${GOOGLE_PROXY_HOST}:${GOOGLE_PROXY_PORT}"
@@ -48,25 +49,31 @@ pipeline {
                     // Folder name from GitHub (used for build context / cd into folder)
                     env.SOURCE_FOLDER = params.GOOGLE_CLOUD_RUN_SERVICE_NAME
                     
-                    // Strip trailing "_new" for all GCP resource names
-                    env.SERVICE_NAME = params.GOOGLE_CLOUD_RUN_SERVICE_NAME.replaceAll(/_new$/, '')
+                    // Original name with "_new" stripped — keeps underscores (used for endpoint path)
+                    env.ORIGINAL_NAME = params.GOOGLE_CLOUD_RUN_SERVICE_NAME.replaceAll(/_new$/, '')
                     
-                    // Derive everything from the cleaned name
-                    env.IMAGE_NAME           = env.SERVICE_NAME
-                    env.PUBSUB_TOPIC         = env.SERVICE_NAME
-                    env.PUBSUB_SUBSCRIPTION  = env.SERVICE_NAME
-                    env.PUSH_ENDPOINT_PATH   = "/${env.SERVICE_NAME}"
+                    // Hyphenated name for GCP resources that don't allow underscores (Cloud Run, image)
+                    env.SERVICE_NAME = env.ORIGINAL_NAME.replaceAll('_', '-')
+                    
+                    // Derive resource names
+                    env.IMAGE_NAME          = env.SERVICE_NAME
+                    env.PUBSUB_TOPIC        = env.SERVICE_NAME
+                    env.PUBSUB_SUBSCRIPTION = env.SERVICE_NAME
+                    
+                    // Push endpoint path uses ORIGINAL name (with underscores) to match app route
+                    env.PUSH_ENDPOINT_PATH = "/${env.ORIGINAL_NAME}"
                     
                     // Build the docker tag URL with the cleaned image name
                     env.DOCKER_TAG_URL = "${env.AR_HOST}/${env.AR_PROJECT}/${env.AR_REPO}/${env.IMAGE_NAME}"
                     
                     echo "============================================="
-                    echo "Source folder:     ${env.SOURCE_FOLDER}"
-                    echo "Service name:      ${env.SERVICE_NAME}"
-                    echo "Image name:        ${env.IMAGE_NAME}"
-                    echo "Docker tag URL:    ${env.DOCKER_TAG_URL}"
-                    echo "Topic:             ${env.PUBSUB_TOPIC}"
-                    echo "Subscription:      ${env.PUBSUB_SUBSCRIPTION}"
+                    echo "Source folder:      ${env.SOURCE_FOLDER}"
+                    echo "Original name:      ${env.ORIGINAL_NAME}"
+                    echo "Service name (GCP): ${env.SERVICE_NAME}"
+                    echo "Image name:         ${env.IMAGE_NAME}"
+                    echo "Docker tag URL:     ${env.DOCKER_TAG_URL}"
+                    echo "Topic:              ${env.PUBSUB_TOPIC}"
+                    echo "Subscription:       ${env.PUBSUB_SUBSCRIPTION}"
                     echo "Push endpoint path: ${env.PUSH_ENDPOINT_PATH}"
                     echo "============================================="
                 }
@@ -139,26 +146,24 @@ pipeline {
             }
         }
         
-        stage("Resolve Image Digest") {
-            steps {
-                withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
-                    script {
-                        // Resolve the image to its sha256 digest for immutable deployments
-                        env.IMAGE_DIGEST = sh(
-                            returnStdout: true,
-                            script: '''
-                                gcloud artifacts docker images describe \
-                                    "${DOCKER_TAG_URL}:${SHORT_COMMIT_ID}" \
-                                    --format='value(image_summary.digest)'
-                            '''
-                        ).trim()
-                        
-                        env.MY_IMAGE = "${env.DOCKER_TAG_URL}@${env.IMAGE_DIGEST}"
-                        echo "Resolved image: ${env.MY_IMAGE}"
-                    }
-                }
-            }
-        }
+        // stage("Resolve Image Digest") {
+        //     steps {
+        //         withCredentials([file(credentialsId: 'hifsl-cloudrun-sa', variable: 'SERVICE_ACC_FILE')]) {
+        //             script {
+        //                 env.IMAGE_DIGEST = sh(
+        //                     returnStdout: true,
+        //                     script: '''
+        //                         gcloud artifacts docker images describe \
+        //                             "${DOCKER_TAG_URL}:${SHORT_COMMIT_ID}" \
+        //                             --format='value(image_summary.digest)'
+        //                     '''
+        //                 ).trim()
+        //                 env.MY_IMAGE = "${env.DOCKER_TAG_URL}@${env.IMAGE_DIGEST}"
+        //                 echo "Resolved image: ${env.MY_IMAGE}"
+        //             }
+        //         }
+        //     }
+        // }
         
         stage("Deploy to Cloud Run") {
             steps {
@@ -169,7 +174,7 @@ pipeline {
                             --max-instances=1 \
                             --port=8080 \
                             --service-account=${MY_SA_EMAIL} \
-                            --image=${MY_IMAGE} \
+                            --image=${DOCKER_TAG_URL}:${SHORT_COMMIT_ID} \
                             --no-allow-unauthenticated \
                             --vpc-connector=${MY_VPC_CONNECTOR} \
                             --vpc-egress=all-traffic \
@@ -181,18 +186,11 @@ pipeline {
                     '''
                     
                     script {
-                        // Capture the deployed Cloud Run service URL
-                        env.CLOUD_RUN_URL = sh(
-                            returnStdout: true,
-                            script: '''
-                                gcloud run services describe ${SERVICE_NAME} \
-                                    --region=${MY_REGION} \
-                                    --project=${PROJECT_ID} \
-                                    --format='value(status.url)'
-                            '''
-                        ).trim()
+                        // Construct the new-format Cloud Run URL: https://<service>-<project-number>.<region>.run.app
+                        env.CLOUD_RUN_URL = "https://${env.SERVICE_NAME}-${env.PROJECT_NUMBER}.${env.MY_REGION}.run.app"
                         env.PUSH_ENDPOINT = "${env.CLOUD_RUN_URL}${env.PUSH_ENDPOINT_PATH}"
-                        echo "Cloud Run URL: ${env.CLOUD_RUN_URL}"
+                        
+                        echo "Cloud Run URL:      ${env.CLOUD_RUN_URL}"
                         echo "Full push endpoint: ${env.PUSH_ENDPOINT}"
                     }
                 }
@@ -271,7 +269,7 @@ pipeline {
             echo "Pipeline completed successfully."
             echo "Source folder:     ${env.SOURCE_FOLDER}"
             echo "Service name:      ${env.SERVICE_NAME}"
-            echo "Image:             ${env.MY_IMAGE}"
+            echo "Image:             ${env.DOCKER_TAG_URL}:${env.SHORT_COMMIT_ID}"
             echo "Cloud Run URL:     ${env.CLOUD_RUN_URL}"
             echo "Push endpoint:     ${env.PUSH_ENDPOINT}"
             echo "Topic:             ${env.PUBSUB_TOPIC}"
