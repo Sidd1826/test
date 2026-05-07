@@ -1,0 +1,23 @@
+stage("Strip requirements.txt versions") {
+    steps {
+        sh '''
+            REQ_FILE="${SOURCE_FOLDER}/requirements.txt"
+            
+            if [ -f "$REQ_FILE" ]; then
+                echo "Original requirements.txt:"
+                cat "$REQ_FILE"
+                echo "---"
+                
+                # Strip everything from the first version specifier onward
+                # Handles ==, >=, <=, ~=, !=, >, <
+                sed -i -E 's/[[:space:]]*(==|>=|<=|~=|!=|>|<).*$//' "$REQ_FILE"
+                
+                echo "Modified requirements.txt:"
+                cat "$REQ_FILE"
+                echo "---"
+            else
+                echo "No requirements.txt found at $REQ_FILE — skipping."
+            fi
+        '''
+    }
+}
