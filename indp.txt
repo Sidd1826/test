@@ -1,0 +1,121 @@
+def indp_bq_to_az() -> dict:
+    logger.info("=" * 60)
+    logger.info("Pipeline START")
+    logger.info("BQ  Table: %s", BQ_TABLE)
+    logger.info("Filter   : %s", PARTITION_FILTER)
+    logger.info("SQL Table: %s", SQL_TABLE)
+    logger.info("=" * 60)
+
+    # ─── Step 1: Count check BEFORE any destructive action ───
+    total_rows = get_total_count()
+
+    if total_rows == 0:
+        logger.warning("No rows found in BQ. Pipeline exiting WITHOUT DB changes.")
+        return {"status": "skipped", "reason": "no_data_in_bq", "total_rows": 0}
+
+    # ─── Step 2: Safety threshold ───
+    if total_rows < MIN_EXPECTED_ROWS:
+        logger.error(
+            "Row count (%d) below safety threshold (%d). "
+            "Pipeline exiting WITHOUT DB changes. Investigate upstream.",
+            total_rows, MIN_EXPECTED_ROWS
+        )
+        return {
+            "status": "aborted",
+            "reason": "row_count_below_threshold",
+            "total_rows": total_rows,
+        }
+
+    # ─── Step 3: Build offsets ───
+    offsets = []
+    for b in range(0, total_rows, BATCH_SIZE):
+        actual_size = min(BATCH_SIZE, total_rows - b)
+        offsets.append((b, actual_size))
+
+    num_batches = len(offsets)
+    logger.info(
+        "Total rows=%d batches=%d batch_size=%d last_batch_size=%d",
+        total_rows, num_batches, BATCH_SIZE, offsets[-1][1],
+    )
+
+    # ─── Step 4: Fetch ALL batches FIRST (no Azure touch yet) ───
+    logger.info("Phase 1: fetching all batches from BQ...")
+    pipeline_start = time.time()
+    all_insert_rows = []
+    total_fetched = 0
+    total_skipped = 0
+    failed_batches = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_and_clean_batch, offset, size): (batch_num, offset, size)
+            for batch_num, (offset, size) in enumerate(offsets, 1)
+        }
+        for future in as_completed(futures):
+            batch_num, offset, size = futures[future]
+            try:
+                insert_rows, fetched, skipped = future.result()
+                all_insert_rows.extend(insert_rows)
+                total_fetched += fetched
+                total_skipped += skipped
+                logger.info(
+                    "[FETCH] batch %d/%d offset=%d fetched=%d skipped=%d valid=%d",
+                    batch_num, num_batches, offset, fetched, skipped, len(insert_rows)
+                )
+            except Exception as exc:
+                logger.error("[FETCH] batch %d/%d FAILED at offset=%d: %s",
+                             batch_num, num_batches, offset, exc)
+                failed_batches.append((batch_num, offset, size, str(exc)))
+
+    # ─── Step 5: Abort if any batch failed ───
+    if failed_batches:
+        logger.error("=" * 60)
+        logger.error("⚠️  %d/%d batches FAILED during fetch.", len(failed_batches), num_batches)
+        logger.error("⚠️  Pipeline ABORTED — Azure SQL data is preserved.")
+        for bn, off, sz, err in failed_batches:
+            logger.error("   Failed batch %d (offset=%d size=%d): %s", bn, off, sz, err)
+        logger.error("=" * 60)
+        return {
+            "status": "aborted",
+            "reason": "batch_fetch_failures",
+            "failed_batches": len(failed_batches),
+            "total_batches": num_batches,
+        }
+
+    logger.info("Phase 1 complete. Total valid rows ready to insert: %d", len(all_insert_rows))
+
+    # ─── Step 6: Only NOW truncate + insert (we know all data is ready) ───
+    sql_engine = _get_sql_engine()
+    total_inserted = 0
+    try:
+        logger.info("Phase 2: truncating target table...")
+        truncate_table(sql_engine)
+
+        logger.info("Phase 2: inserting %d rows...", len(all_insert_rows))
+        insert_start = time.time()
+        total_inserted = bulk_insert_rows(sql_engine, all_insert_rows)
+        logger.info("[INSERT] done — %d rows in %.2fs",
+                    total_inserted, time.time() - insert_start)
+    finally:
+        sql_engine.dispose()
+        logger.info("SQL engine disposed.")
+
+    # ─── Step 7: Summary ───
+    total_elapsed = time.time() - pipeline_start
+    summary = {
+        "status": "success",
+        "total_rows_in_bq": total_rows,
+        "total_fetched": total_fetched,
+        "total_skipped": total_skipped,
+        "total_inserted": total_inserted,
+        "failed_batches": 0,
+        "time_elapsed_in_seconds": round(total_elapsed, 2),
+        "time_elapsed_in_minutes": round(total_elapsed / 60, 1),
+    }
+
+    logger.info("=" * 60)
+    logger.info("Pipeline Complete")
+    for k, v in summary.items():
+        logger.info("%-25s: %s", k, v)
+    logger.info("=" * 60)
+    return summary
