@@ -1,20 +1,24 @@
-Background / Problem Statement
-	1.	The Bank’s FRI and MNRL data access was dependent on a single team, creating a significant operational bottleneck and a single point of failure.
-	2.	Data requests required manual email coordination, leading to a 2–3 hour turnaround time per request, with no audit trail of who accessed what and when.
-	3.	This dependency was flagged as a gap against RBI Compliance requirements mentioned in the circular, which mandates timely access to FRI/MNRL data and traceable handling.
-	4.	There was no centralized repository for historical exports — past data pulls were scattered across individual mailboxes and local machines, making re-retrieval and audit reconstruction nearly impossible.
-	5.	Downstream teams also needed to match exported MNRL/FRI mobile numbers against the Bank’s internal customer base of ~30 lakh records — this was being done manually in Excel, which was slow, error-prone, and could not scale.
+Here’s the diff between Phase 1 and Phase 2 of the platform:
 
-Solution Goals & Objectives
-To address the challenges faced by different teams in accessing and processing MNRL & FRI data:
-	1.	Build a self-service portal where any authorized user can log in, select a date, and download FRI/MNRL data on demand — without depending on the central team.
-	2.	Eliminate intermediary dependency and enable direct, role-based access for end users with full audit logging.
-	3.	Provide a centralized cloud repository (Azure Blob Storage + PostgreSQL metadata) so every export is permanently archived and re-downloadable, ensuring RBI regulatory compliance.
-	4.	Add a built-in Matchoff capability that lets users match exported mobile numbers against the Bank’s internal customer database and download an enriched output with cust_id attached — replacing manual Excel VLOOKUPs.
-	5.	Handle large-volume exports gracefully — datasets exceeding Excel’s 10-lakh row limit are automatically split into multiple numbered files, each independently archived.
-
-TO-BE Process
-A React JS frontend with a Flask (Python 3.11) backend, hosted on Azure App Service, backed by Azure Blob Storage for files and Azure PostgreSQL for metadata.
-Users log in, select module (FRI/MNRL), date, and data type, and preview the record count before exporting. The backend pulls data from upstream APIs in batches of 3,000 records, streams them into Excel, and uploads the file(s) to Azure Blob Storage under a dated folder. Exports exceeding 10 lakh rows are auto-split into numbered parts. Every file is archived with full metadata in PostgreSQL, and users download directly via short-lived SAS URLs — typically in 35–40 seconds.
-The platform also offers a Matchoff workflow: users pick any previously exported file, and the system matches its mobile numbers against the Bank’s internal customer base (~30 lakh rows in mobilecleanup) using parallel chunked SQL queries. Matched rows are enriched with cust_id, uploaded as a new Excel to matchoff-output/, logged in matchoff_runs, and returned to the user via a 24-hour SAS download link.
-Every export and matchoff run is permanently archived and audit-logged — meeting RBI compliance for traceability while reducing turnaround from 2–3 hours to under a minute.​​​​​​​​​​​​​​​​
+What Changed: Phase 1 → Phase 2
+Storage & Infrastructure
+	•	Phase 1 used Dataverse for archival; Phase 2 moved to Azure Blob Storage (file storage) + Azure PostgreSQL (metadata), giving cheaper storage, faster I/O, and proper SQL querying for audit.
+Volume Handling
+	•	Phase 1 generated a single Excel per export, which broke when datasets crossed Excel’s ~10-lakh row limit. Phase 2 auto-splits large exports into numbered parts (_part1.xlsx, _part2.xlsx, …), each uploaded and archived independently.
+Memory Footprint
+	•	Phase 1 built Excel files in standard mode (full workbook held in RAM). Phase 2 uses openpyxl write-only streaming, so memory stays flat regardless of row count — large exports no longer crash the App Service worker.
+Download Mechanism
+	•	Phase 1 streamed the file straight to the user’s browser at generation time. Phase 2 uploads to Blob first, then serves short-lived SAS URLs — making files re-downloadable any time without re-running the export.
+Centralized Repository
+	•	Phase 1 had no persistent central store beyond Dataverse rows. Phase 2 introduces a true repository: every file lives at a predictable blob path under a YYYY-MM-DD/ folder, with a corresponding export_files row carrying module, blob path, record count, date, and timestamp.
+New Capability — Matchoff (Phase 2 only)
+	•	Phase 1 had no mobile-number matching; downstream teams did this manually in Excel. Phase 2 adds a full Matchoff workflow: pick any archived file, match its mobile numbers against the 30-lakh mobilecleanup table via parallel chunked SQL (1,000 per chunk, 5 workers, pooled connections), and download an enriched Excel with cust_id attached.
+Reference Data Store (Phase 2 only)
+	•	Phase 2 introduces the mobilecleanup PostgreSQL table — a one-time bulk load of the Bank’s ~30 lakh internal customer mobile numbers, indexed on final_mob_num — to power Matchoff lookups.
+Audit & Compliance
+	•	Phase 1 logged exports loosely in Dataverse. Phase 2 has dedicated audit tables: export_files for every export (and every part of a split export) and matchoff_runs for every matching job, with source file, input rows, matched count, and run date — giving a fully reconstructable RBI audit trail.
+Performance Engineering
+	•	Phase 2 adds psycopg2 connection pooling (ThreadedConnectionPool) and chunked blob uploads for files > 64 MB, so parallel workers reuse connections and large uploads don’t spike memory.
+Turnaround
+	•	Phase 1: ~35–40 seconds for a standard export, then manual matching in Excel afterwards (hours).
+	•	Phase 2: ~35–40 seconds for export, plus seconds-to-minutes for matchoff on the same UI — end-to-end under a minute for most requests.​​​​​​​​​​​​​​​​
